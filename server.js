@@ -70,6 +70,10 @@ app.use((req, res, next) => {
   next();
 });
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function requireMetaConfig() {
   if (!META_ACCESS_TOKEN || !IG_USER_ID) {
     throw new Error("Missing META_ACCESS_TOKEN or IG_USER_ID.");
@@ -145,11 +149,20 @@ function parseJsonLoose(text) {
 function detectMediaTypeFromUrl(url) {
   const lower = String(url || "").split("?")[0].toLowerCase();
 
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")) {
+  if (
+    lower.endsWith(".jpg") ||
+    lower.endsWith(".jpeg") ||
+    lower.endsWith(".png") ||
+    lower.endsWith(".webp")
+  ) {
     return "image";
   }
 
-  if (lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".m4v")) {
+  if (
+    lower.endsWith(".mp4") ||
+    lower.endsWith(".mov") ||
+    lower.endsWith(".m4v")
+  ) {
     return "video";
   }
 
@@ -163,11 +176,21 @@ function detectMediaTypeFromFile(file) {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";
 
-  if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png") || name.endsWith(".webp") || name.endsWith(".heic")) {
+  if (
+    name.endsWith(".jpg") ||
+    name.endsWith(".jpeg") ||
+    name.endsWith(".png") ||
+    name.endsWith(".webp") ||
+    name.endsWith(".heic")
+  ) {
     return "image";
   }
 
-  if (name.endsWith(".mp4") || name.endsWith(".mov") || name.endsWith(".m4v")) {
+  if (
+    name.endsWith(".mp4") ||
+    name.endsWith(".mov") ||
+    name.endsWith(".m4v")
+  ) {
     return "video";
   }
 
@@ -175,27 +198,13 @@ function detectMediaTypeFromFile(file) {
 }
 
 function normalizeMediaInput(body) {
-  const rawMediaType =
-    body.mediaType ||
-    body.media_type ||
-    null;
+  const rawMediaType = body.mediaType || body.media_type || null;
 
-  const imageUrl =
-    body.imageUrl ||
-    body.image_url ||
-    null;
-
-  const videoUrl =
-    body.videoUrl ||
-    body.video_url ||
-    null;
+  const imageUrl = body.imageUrl || body.image_url || null;
+  const videoUrl = body.videoUrl || body.video_url || null;
 
   const mediaUrl =
-    body.mediaUrl ||
-    body.media_url ||
-    imageUrl ||
-    videoUrl ||
-    null;
+    body.mediaUrl || body.media_url || imageUrl || videoUrl || null;
 
   let mediaType = rawMediaType ? String(rawMediaType).toLowerCase() : null;
 
@@ -316,36 +325,64 @@ async function uploadVideo(file) {
   };
 }
 
+/**
+ * Wait until Meta media container is ready.
+ * This is required for BOTH images and videos.
+ * Without this, Meta may return code 9007:
+ * "Media ID is not available"
+ */
 async function pollMediaContainerStatus(containerId) {
-  for (let attempt = 1; attempt <= 20; attempt += 1) {
+  console.log(`Waiting for Meta container to be ready: ${containerId}`);
+
+  await sleep(3000);
+
+  for (let attempt = 1; attempt <= 24; attempt += 1) {
     try {
-      const response = await axios.get(`${GRAPH_HOST}/${GRAPH_VERSION}/${containerId}`, {
-        params: {
-          fields: "status_code,status",
-          access_token: META_ACCESS_TOKEN
-        },
-        timeout: 30000
-      });
+      const response = await axios.get(
+        `${GRAPH_HOST}/${GRAPH_VERSION}/${containerId}`,
+        {
+          params: {
+            fields: "status_code,status",
+            access_token: META_ACCESS_TOKEN
+          },
+          timeout: 30000
+        }
+      );
 
       const statusCode = response.data?.status_code;
       const status = response.data?.status;
+
+      console.log(
+        `Meta container ${containerId} status attempt ${attempt}:`,
+        statusCode || status || response.data
+      );
 
       if (statusCode === "FINISHED") {
         return response.data;
       }
 
       if (statusCode === "ERROR") {
-        throw new Error(`Meta media container failed: ${status || "Unknown error"}`);
+        throw new Error(
+          `Meta media container failed: ${status || "Unknown error"}`
+        );
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await sleep(5000);
     } catch (error) {
-      if (attempt === 20) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      console.warn(
+        `Meta container status check failed attempt ${attempt}:`,
+        error.response?.data || error.message
+      );
+
+      if (attempt === 24) {
+        throw error;
+      }
+
+      await sleep(5000);
     }
   }
 
-  throw new Error("Timed out waiting for Meta media container processing.");
+  throw new Error("Meta media container did not finish processing in time.");
 }
 
 /**
@@ -353,7 +390,13 @@ async function pollMediaContainerStatus(containerId) {
  * image => image_url + media_type IMAGE
  * video => video_url + media_type VIDEO
  */
-async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, caption }) {
+async function publishToInstagram({
+  mediaUrl,
+  imageUrl,
+  videoUrl,
+  mediaType,
+  caption
+}) {
   requireMetaConfig();
 
   const finalMediaUrl = mediaUrl || imageUrl || videoUrl;
@@ -384,6 +427,11 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
     params.media_type = "VIDEO";
   }
 
+  console.log("Creating Meta media container:", {
+    mediaType: finalMediaType,
+    mediaUrl: finalMediaUrl
+  });
+
   const containerResponse = await axios.post(createContainerUrl, null, {
     params,
     timeout: 60000
@@ -395,23 +443,54 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
     throw new Error("Meta did not return creation_id.");
   }
 
-  if (finalMediaType === "video") {
-    await pollMediaContainerStatus(creationId);
-  }
+  console.log(`Meta media container created: ${creationId}`);
+
+  // IMPORTANT: Poll for images and videos.
+  await pollMediaContainerStatus(creationId);
 
   const publishUrl = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}/media_publish`;
 
-  const publishResponse = await axios.post(publishUrl, null, {
-    params: {
-      creation_id: creationId,
-      access_token: META_ACCESS_TOKEN
-    },
-    timeout: 60000
-  });
+  let publishResponse = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      console.log(`Publishing Meta container ${creationId}, attempt ${attempt}`);
+
+      publishResponse = await axios.post(publishUrl, null, {
+        params: {
+          creation_id: creationId,
+          access_token: META_ACCESS_TOKEN
+        },
+        timeout: 60000
+      });
+
+      break;
+    } catch (error) {
+      const metaCode = error.response?.data?.error?.code;
+
+      console.warn(
+        `Meta publish failed attempt ${attempt}:`,
+        error.response?.data || error.message
+      );
+
+      if (metaCode === 9007 && attempt < 3) {
+        console.warn("Meta media not ready yet. Retrying publish in 10 seconds...");
+        await sleep(10000);
+        await pollMediaContainerStatus(creationId);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  if (!publishResponse?.data?.id) {
+    throw new Error("Meta did not return publish ID.");
+  }
 
   return {
     creationId,
-    publishId: publishResponse.data?.id,
+    publishId: publishResponse.data.id,
     mediaType: finalMediaType,
     mediaUrl: finalMediaUrl
   };
@@ -848,7 +927,9 @@ app.post("/api/meta/publish-now", async (req, res) => {
       friendlyMessage:
         error.response?.data?.error?.code === 9004
           ? "Meta could not fetch this media URL. Re-upload the file and make sure Cloudinary URL is used."
-          : undefined
+          : error.response?.data?.error?.code === 9007
+            ? "Meta media is not ready yet. The backend waited and retried, but Meta still did not make it available."
+            : undefined
     });
   }
 });
