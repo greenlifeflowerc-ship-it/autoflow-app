@@ -20,13 +20,8 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-/**
- * IMPORTANT:
- * For IGAA Instagram token, use graph.instagram.com
- * For Facebook/Page token, use graph.facebook.com
- */
-const GRAPH_VERSION = process.env.GRAPH_VERSION || "v19.0";
 const GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
+const GRAPH_VERSION = process.env.GRAPH_VERSION || "v25.0";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const IG_USER_ID = process.env.IG_USER_ID;
@@ -55,10 +50,10 @@ const upload = multer({
 });
 
 /**
- * TEMP DATABASE
- * This is memory storage only.
- * On Render restart/redeploy, posts will be lost.
- * Later replace with Supabase/PostgreSQL.
+ * Temporary memory storage.
+ * Good for testing only.
+ * On Render restart/redeploy, scheduled posts will be lost.
+ * Later use Supabase/PostgreSQL.
  */
 const posts = [];
 
@@ -74,7 +69,9 @@ function getBaseUrl(req) {
 
 function requireMetaConfig() {
   if (!META_ACCESS_TOKEN || !IG_USER_ID) {
-    throw new Error("Missing META_ACCESS_TOKEN or IG_USER_ID in environment variables.");
+    throw new Error(
+      "Missing META_ACCESS_TOKEN or IG_USER_ID in environment variables."
+    );
   }
 }
 
@@ -133,7 +130,8 @@ async function fetchImageAsInlineData(imageUrl) {
   });
 
   const mimeType =
-    response.headers["content-type"] && response.headers["content-type"].startsWith("image/")
+    response.headers["content-type"] &&
+    response.headers["content-type"].startsWith("image/")
       ? response.headers["content-type"]
       : "image/jpeg";
 
@@ -160,9 +158,9 @@ function saveBase64Image({ base64Data, mimeType, req }) {
 }
 
 /**
- * Instagram publishing:
- * 1. Create media container
- * 2. Publish container
+ * Instagram publish:
+ * 1. POST /{IG_USER_ID}/media
+ * 2. POST /{IG_USER_ID}/media_publish
  */
 async function publishToInstagram({ imageUrl, caption }) {
   requireMetaConfig();
@@ -380,7 +378,7 @@ async function editImageWithGemini({
 
     throw new Error(
       textOutput ||
-        "Gemini image model did not return image data. Check model access or use another image model."
+        "Gemini image model did not return image data. Check image model access."
     );
   }
 
@@ -427,29 +425,11 @@ app.get("/api/health", (req, res) => {
 async function testMetaConnection() {
   requireMetaConfig();
 
-  if (GRAPH_HOST.includes("instagram.com")) {
-    const url = `${GRAPH_HOST}/${GRAPH_VERSION}/me`;
-
-    const response = await axios.get(url, {
-      params: {
-        fields: "id,username",
-        access_token: META_ACCESS_TOKEN
-      }
-    });
-
-    return {
-      account: response.data,
-      configuredIgUserId: IG_USER_ID,
-      idMatches: String(response.data.id) === String(IG_USER_ID),
-      graphHost: GRAPH_HOST
-    };
-  }
-
-  const url = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}`;
+  const url = `${GRAPH_HOST}/${GRAPH_VERSION}/me`;
 
   const response = await axios.get(url, {
     params: {
-      fields: "id,username,name",
+      fields: "user_id,username",
       access_token: META_ACCESS_TOKEN
     }
   });
@@ -457,8 +437,9 @@ async function testMetaConnection() {
   return {
     account: response.data,
     configuredIgUserId: IG_USER_ID,
-    idMatches: String(response.data.id) === String(IG_USER_ID),
-    graphHost: GRAPH_HOST
+    idMatches: String(response.data.user_id) === String(IG_USER_ID),
+    graphHost: GRAPH_HOST,
+    graphVersion: GRAPH_VERSION
   };
 }
 
@@ -608,7 +589,8 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
 app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
   try {
     const imageUrl = getBodyValue(req.body, "imageUrl", "image_url");
-    const editStyle = req.body.editStyle || req.body.edit_style || "luxury interior background";
+    const editStyle =
+      req.body.editStyle || req.body.edit_style || "luxury interior background";
     const language = req.body.language || "english";
     const model = req.body.model || req.body.selectedModel || GEMINI_TEXT_MODEL;
 
@@ -687,7 +669,6 @@ app.post("/api/ai/edit-image", async (req, res) => {
 
 /**
  * UPLOAD IMAGE
- * Accepts any file field name: image, file, photo, etc.
  */
 app.post("/api/upload", upload.any(), (req, res) => {
   try {
