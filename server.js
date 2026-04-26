@@ -19,11 +19,22 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
+
+/**
+ * IMPORTANT:
+ * For IGAA Instagram token, use graph.instagram.com
+ * For Facebook/Page token, use graph.facebook.com
+ */
 const GRAPH_VERSION = process.env.GRAPH_VERSION || "v19.0";
+const GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const IG_USER_ID = process.env.IG_USER_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-1.5-flash";
+const GEMINI_IMAGE_MODEL =
+  process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,8 +54,12 @@ const upload = multer({
   }
 });
 
-// TEMP in-memory posts. Good for testing only.
-// Later replace this with Supabase/PostgreSQL.
+/**
+ * TEMP DATABASE
+ * This is memory storage only.
+ * On Render restart/redeploy, posts will be lost.
+ * Later replace with Supabase/PostgreSQL.
+ */
 const posts = [];
 
 app.use((req, res, next) => {
@@ -103,6 +118,52 @@ function getBodyValue(body, camelKey, snakeKey) {
   return body[camelKey] ?? body[snakeKey];
 }
 
+function parseJsonLoose(text) {
+  try {
+    return JSON.parse(String(text).replace(/```json|```/g, "").trim());
+  } catch {
+    return null;
+  }
+}
+
+async function fetchImageAsInlineData(imageUrl) {
+  const response = await axios.get(imageUrl, {
+    responseType: "arraybuffer",
+    timeout: 30000
+  });
+
+  const mimeType =
+    response.headers["content-type"] && response.headers["content-type"].startsWith("image/")
+      ? response.headers["content-type"]
+      : "image/jpeg";
+
+  return {
+    inlineData: {
+      mimeType,
+      data: Buffer.from(response.data).toString("base64")
+    }
+  };
+}
+
+function saveBase64Image({ base64Data, mimeType, req }) {
+  let ext = ".png";
+
+  if (mimeType === "image/jpeg" || mimeType === "image/jpg") ext = ".jpg";
+  if (mimeType === "image/webp") ext = ".webp";
+
+  const fileName = `${randomUUID()}${ext}`;
+  const filePath = path.join(uploadsDir, fileName);
+
+  fs.writeFileSync(filePath, Buffer.from(base64Data, "base64"));
+
+  return `${getBaseUrl(req)}/uploads/${fileName}`;
+}
+
+/**
+ * Instagram publishing:
+ * 1. Create media container
+ * 2. Publish container
+ */
 async function publishToInstagram({ imageUrl, caption }) {
   requireMetaConfig();
 
@@ -110,7 +171,7 @@ async function publishToInstagram({ imageUrl, caption }) {
     throw new Error("imageUrl must be a public direct URL.");
   }
 
-  const createContainerUrl = `https://graph.facebook.com/${GRAPH_VERSION}/${IG_USER_ID}/media`;
+  const createContainerUrl = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}/media`;
 
   const containerResponse = await axios.post(createContainerUrl, null, {
     params: {
@@ -126,7 +187,7 @@ async function publishToInstagram({ imageUrl, caption }) {
     throw new Error("Meta did not return creation_id.");
   }
 
-  const publishUrl = `https://graph.facebook.com/${GRAPH_VERSION}/${IG_USER_ID}/media_publish`;
+  const publishUrl = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}/media_publish`;
 
   const publishResponse = await axios.post(publishUrl, null, {
     params: {
@@ -141,7 +202,7 @@ async function publishToInstagram({ imageUrl, caption }) {
   };
 }
 
-async function generateWithGemini(prompt, modelName = "gemini-1.5-flash") {
+async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL) {
   requireGeminiConfig();
 
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -151,11 +212,24 @@ async function generateWithGemini(prompt, modelName = "gemini-1.5-flash") {
   return result.response.text();
 }
 
-function parseJsonLoose(text) {
+async function generateTextWithGeminiVision({
+  imageUrl,
+  prompt,
+  modelName = GEMINI_TEXT_MODEL
+}) {
+  requireGeminiConfig();
+
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({ model: modelName });
+
   try {
-    return JSON.parse(text.replace(/```json|```/g, "").trim());
-  } catch {
-    return null;
+    const imagePart = await fetchImageAsInlineData(imageUrl);
+    const result = await model.generateContent([prompt, imagePart]);
+    return result.response.text();
+  } catch (error) {
+    console.warn("Gemini vision fallback to text-only:", error.message);
+    const result = await model.generateContent(`${prompt}\n\nImage URL: ${imageUrl}`);
+    return result.response.text();
   }
 }
 
@@ -163,15 +237,12 @@ async function generateCaptionWithGemini({
   imageUrl,
   language = "arabic",
   tone = "premium",
-  model = "gemini-1.5-flash"
+  model = GEMINI_TEXT_MODEL
 }) {
   const prompt = `
 You are a social media marketing assistant for artificial trees, artificial flowers, and luxury decoration products.
 
-Generate Instagram content for this image.
-
-Image URL:
-${imageUrl}
+Analyze the provided product image and generate Instagram content.
 
 Language:
 ${language}
@@ -187,7 +258,12 @@ Return strict JSON only:
 }
 `;
 
-  const text = await generateWithGemini(prompt, model);
+  const text = await generateTextWithGeminiVision({
+    imageUrl,
+    prompt,
+    modelName: model
+  });
+
   const parsed = parseJsonLoose(text);
 
   if (parsed) {
@@ -209,13 +285,10 @@ async function generateEditPromptWithGemini({
   imageUrl,
   editStyle = "luxury interior background",
   language = "english",
-  model = "gemini-1.5-flash"
+  model = GEMINI_TEXT_MODEL
 }) {
   const prompt = `
-Create a professional AI image editing prompt for a product image.
-
-Image URL:
-${imageUrl}
+Create a professional AI image editing prompt for this product image.
 
 Edit style:
 ${editStyle}
@@ -241,44 +314,161 @@ Return strict JSON only:
 }
 `;
 
-  const text = await generateWithGemini(prompt, model);
+  const text = await generateTextWithGeminiVision({
+    imageUrl,
+    prompt,
+    modelName: model
+  });
+
   const parsed = parseJsonLoose(text);
 
   return {
-    prompt: parsed?.prompt || text.replace(/```json|```/g, "").trim()
+    prompt: parsed?.prompt || String(text).replace(/```json|```/g, "").trim()
   };
 }
 
+async function editImageWithGemini({
+  originalImageUrl,
+  prompt,
+  model = GEMINI_IMAGE_MODEL,
+  req
+}) {
+  requireGeminiConfig();
+
+  if (!originalImageUrl || !isPublicUrl(originalImageUrl)) {
+    throw new Error("originalImageUrl must be a public URL.");
+  }
+
+  if (!prompt) {
+    throw new Error("prompt is required.");
+  }
+
+  const imagePart = await fetchImageAsInlineData(originalImageUrl);
+
+  const requestBody = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: prompt
+          },
+          imagePart
+        ]
+      }
+    ]
+  };
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  const response = await axios.post(url, requestBody, {
+    params: {
+      key: GEMINI_API_KEY
+    },
+    headers: {
+      "Content-Type": "application/json"
+    },
+    timeout: 120000
+  });
+
+  const parts = response.data?.candidates?.[0]?.content?.parts || [];
+
+  const imageOutput = parts.find((part) => part.inlineData || part.inline_data);
+
+  if (!imageOutput) {
+    const textOutput = parts.map((part) => part.text).filter(Boolean).join("\n");
+
+    throw new Error(
+      textOutput ||
+        "Gemini image model did not return image data. Check model access or use another image model."
+    );
+  }
+
+  const inlineData = imageOutput.inlineData || imageOutput.inline_data;
+
+  const editedImageUrl = saveBase64Image({
+    base64Data: inlineData.data,
+    mimeType: inlineData.mimeType || inlineData.mime_type || "image/png",
+    req
+  });
+
+  return {
+    edited_image_url: editedImageUrl,
+    editedImageUrl,
+    model
+  };
+}
+
+/**
+ * ROOT + HEALTH
+ */
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     app: "AutoFlow Backend",
-    status: "running"
+    status: "running",
+    graphHost: GRAPH_HOST,
+    graphVersion: GRAPH_VERSION
   });
 });
 
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    graphHost: GRAPH_HOST,
+    graphVersion: GRAPH_VERSION
   });
 });
 
-app.get("/api/meta/test-connection", async (req, res) => {
-  try {
-    requireMetaConfig();
+/**
+ * META TEST
+ */
+async function testMetaConnection() {
+  requireMetaConfig();
 
-    const url = `https://graph.facebook.com/${GRAPH_VERSION}/${IG_USER_ID}`;
+  if (GRAPH_HOST.includes("instagram.com")) {
+    const url = `${GRAPH_HOST}/${GRAPH_VERSION}/me`;
+
     const response = await axios.get(url, {
       params: {
-        fields: "id,username,name",
+        fields: "id,username",
         access_token: META_ACCESS_TOKEN
       }
     });
 
+    return {
+      account: response.data,
+      configuredIgUserId: IG_USER_ID,
+      idMatches: String(response.data.id) === String(IG_USER_ID),
+      graphHost: GRAPH_HOST
+    };
+  }
+
+  const url = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}`;
+
+  const response = await axios.get(url, {
+    params: {
+      fields: "id,username,name",
+      access_token: META_ACCESS_TOKEN
+    }
+  });
+
+  return {
+    account: response.data,
+    configuredIgUserId: IG_USER_ID,
+    idMatches: String(response.data.id) === String(IG_USER_ID),
+    graphHost: GRAPH_HOST
+  };
+}
+
+app.get("/api/meta/test-connection", async (req, res) => {
+  try {
+    const result = await testMetaConnection();
+
     res.json({
       ok: true,
-      account: response.data
+      ...result
     });
   } catch (error) {
     console.error("Meta test failed:", error.response?.data || error.message);
@@ -291,19 +481,11 @@ app.get("/api/meta/test-connection", async (req, res) => {
 
 app.post("/api/meta/test-connection", async (req, res) => {
   try {
-    requireMetaConfig();
-
-    const url = `https://graph.facebook.com/${GRAPH_VERSION}/${IG_USER_ID}`;
-    const response = await axios.get(url, {
-      params: {
-        fields: "id,username,name",
-        access_token: META_ACCESS_TOKEN
-      }
-    });
+    const result = await testMetaConnection();
 
     res.json({
       ok: true,
-      account: response.data
+      ...result
     });
   } catch (error) {
     console.error("Meta test failed:", error.response?.data || error.message);
@@ -314,6 +496,9 @@ app.post("/api/meta/test-connection", async (req, res) => {
   }
 });
 
+/**
+ * PUBLISH NOW
+ */
 app.post("/api/meta/publish-now", async (req, res) => {
   try {
     const imageUrl = getBodyValue(req.body, "imageUrl", "image_url");
@@ -337,13 +522,16 @@ app.post("/api/meta/publish-now", async (req, res) => {
   }
 });
 
+/**
+ * GEMINI TEST
+ */
 app.post("/api/gemini/test", async (req, res) => {
   try {
     requireGeminiConfig();
 
-    const text = await generateWithGemini(
-      "Return strict JSON only: {\"ok\": true, \"message\": \"Gemini connected\"}",
-      req.body.model || "gemini-1.5-flash"
+    const text = await generateTextWithGemini(
+      'Return strict JSON only: {"ok": true, "message": "Gemini connected"}',
+      req.body.model || GEMINI_TEXT_MODEL
     );
 
     res.json({
@@ -360,12 +548,32 @@ app.post("/api/gemini/test", async (req, res) => {
   }
 });
 
+app.get("/api/ai/models", (req, res) => {
+  res.json({
+    ok: true,
+    textModels: [
+      "gemini-1.5-flash",
+      "gemini-2.0-flash",
+      "gemini-2.5-flash"
+    ],
+    imageModels: [
+      "gemini-2.5-flash-image-preview",
+      "gemini-2.5-flash-image"
+    ],
+    defaultTextModel: GEMINI_TEXT_MODEL,
+    defaultImageModel: GEMINI_IMAGE_MODEL
+  });
+});
+
+/**
+ * GENERATE CAPTION
+ */
 app.post("/api/gemini/generate-caption", async (req, res) => {
   try {
     const imageUrl = getBodyValue(req.body, "imageUrl", "image_url");
     const language = req.body.language || "arabic";
     const tone = req.body.tone || "premium";
-    const model = req.body.model || req.body.selectedModel || "gemini-1.5-flash";
+    const model = req.body.model || req.body.selectedModel || GEMINI_TEXT_MODEL;
 
     if (!imageUrl) {
       return res.status(400).json({
@@ -394,12 +602,15 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
   }
 });
 
+/**
+ * GENERATE EDIT PROMPT
+ */
 app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
   try {
     const imageUrl = getBodyValue(req.body, "imageUrl", "image_url");
     const editStyle = req.body.editStyle || req.body.edit_style || "luxury interior background";
     const language = req.body.language || "english";
-    const model = req.body.model || req.body.selectedModel || "gemini-1.5-flash";
+    const model = req.body.model || req.body.selectedModel || GEMINI_TEXT_MODEL;
 
     if (!imageUrl) {
       return res.status(400).json({
@@ -428,49 +639,70 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
   }
 });
 
+/**
+ * AI IMAGE EDITING
+ */
 app.post("/api/ai/edit-image", async (req, res) => {
-  const originalImageUrl =
-    getBodyValue(req.body, "originalImageUrl", "original_image_url") ||
-    getBodyValue(req.body, "imageUrl", "image_url");
-
-  const prompt = req.body.prompt || req.body.ai_edit_prompt || "";
-  const size = req.body.size || "1080x1350";
-  const model = req.body.model || "manual_backend_model";
-
-  if (!originalImageUrl) {
-    return res.status(400).json({
-      ok: false,
-      error: "originalImageUrl is required."
-    });
-  }
-
-  // Real image editing needs an external image-editing provider.
-  // This endpoint is intentionally explicit so the Flutter app does not fail silently.
-  return res.status(501).json({
-    ok: false,
-    error:
-      "AI image editing provider is not configured yet. Add Replicate/OpenAI/Gemini image editing provider in backend.",
-    details: {
-      originalImageUrl,
-      prompt,
-      size,
-      model
-    }
-  });
-});
-
-app.post("/api/upload", upload.single("image"), (req, res) => {
   try {
-    if (!req.file) {
+    const originalImageUrl =
+      getBodyValue(req.body, "originalImageUrl", "original_image_url") ||
+      getBodyValue(req.body, "imageUrl", "image_url");
+
+    const prompt = req.body.prompt || req.body.ai_edit_prompt || "";
+    const model = req.body.model || GEMINI_IMAGE_MODEL;
+
+    if (!originalImageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "No image file uploaded. Use field name: image"
+        error: "originalImageUrl is required."
       });
     }
 
-    const ext = path.extname(req.file.originalname || "") || ".jpg";
-    const newFileName = `${req.file.filename}${ext}`;
-    const oldPath = req.file.path;
+    if (!prompt) {
+      return res.status(400).json({
+        ok: false,
+        error: "prompt is required."
+      });
+    }
+
+    const result = await editImageWithGemini({
+      originalImageUrl,
+      prompt,
+      model,
+      req
+    });
+
+    res.json({
+      ok: true,
+      result
+    });
+  } catch (error) {
+    console.error("AI edit image failed:", error.response?.data || error.message);
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
+/**
+ * UPLOAD IMAGE
+ * Accepts any file field name: image, file, photo, etc.
+ */
+app.post("/api/upload", upload.any(), (req, res) => {
+  try {
+    const file = req.files?.[0];
+
+    if (!file) {
+      return res.status(400).json({
+        ok: false,
+        error: "No image file uploaded. Send multipart/form-data with any file field."
+      });
+    }
+
+    const ext = path.extname(file.originalname || "") || ".jpg";
+    const newFileName = `${file.filename}${ext}`;
+    const oldPath = file.path;
     const newPath = path.join(uploadsDir, newFileName);
 
     fs.renameSync(oldPath, newPath);
@@ -492,6 +724,9 @@ app.post("/api/upload", upload.single("image"), (req, res) => {
   }
 });
 
+/**
+ * CREATE SCHEDULED POST
+ */
 app.post("/api/posts", (req, res) => {
   const imageUrl = getBodyValue(req.body, "imageUrl", "image_url");
   const caption = req.body.caption || "";
@@ -505,29 +740,44 @@ app.post("/api/posts", (req, res) => {
     });
   }
 
+  const now = new Date().toISOString();
+  const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
+
   const post = {
     id: randomUUID(),
+
     imageUrl,
     image_url: imageUrl,
+
     caption,
     hashtags,
-    finalText: `${caption}\n${hashtags.join(" ")}`.trim(),
-    final_text: `${caption}\n${hashtags.join(" ")}`.trim(),
+
+    finalText,
+    final_text: finalText,
+
     scheduledAt,
     scheduled_at: scheduledAt,
+
     status: "approved",
+
     publishAttempts: 0,
     publish_attempts: 0,
+
     metaContainerId: null,
     meta_container_id: null,
+
     metaPublishId: null,
     meta_publish_id: null,
+
     errorMessage: null,
     error_message: null,
-    createdAt: new Date().toISOString(),
-    created_at: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+
+    createdAt: now,
+    created_at: now,
+
+    updatedAt: now,
+    updated_at: now,
+
     publishedAt: null,
     published_at: null
   };
@@ -547,6 +797,9 @@ app.get("/api/posts", (req, res) => {
   });
 });
 
+/**
+ * RETRY FAILED POST
+ */
 app.post("/api/posts/:id/retry", async (req, res) => {
   const post = posts.find((p) => p.id === req.params.id);
 
@@ -599,6 +852,9 @@ app.post("/api/posts/:id/retry", async (req, res) => {
   }
 });
 
+/**
+ * CRON SCHEDULER
+ */
 cron.schedule("*/5 * * * *", async () => {
   const now = new Date();
 
@@ -648,6 +904,9 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
+/**
+ * 404
+ */
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
