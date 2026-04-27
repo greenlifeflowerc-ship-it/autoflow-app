@@ -8,7 +8,7 @@ import fs from "fs";
 import path from "path";
 import sharp from "sharp";
 import { v2 as cloudinary } from "cloudinary";
-import { randomUUID, createHmac, timingSafeEqual } from "crypto";
+import { createHmac, timingSafeEqual, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { createClient } from "@supabase/supabase-js";
@@ -34,7 +34,6 @@ const INSTAGRAM_GRAPH_HOST =
   process.env.GRAPH_HOST || "https://graph.instagram.com";
 const META_GRAPH_HOST =
   process.env.META_GRAPH_HOST || "https://graph.facebook.com";
-
 const GRAPH_VERSION =
   process.env.GRAPH_VERSION || process.env.META_GRAPH_VERSION || "v25.0";
 
@@ -55,9 +54,6 @@ const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
-const AI_DEFAULT_PROVIDER = process.env.AI_DEFAULT_PROVIDER || "gemini";
-const AI_BULK_CONCURRENCY = Number(process.env.AI_BULK_CONCURRENCY || 2);
-
 const DEFAULT_BUSINESS_NAME =
   process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
 const DEFAULT_LOCATION = process.env.DEFAULT_LOCATION || "UAE";
@@ -67,6 +63,16 @@ const DEFAULT_HASHTAG_COUNT = Number(process.env.DEFAULT_HASHTAG_COUNT || 10);
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+
+const CLOUDINARY_SYNC_ENABLED =
+  String(process.env.CLOUDINARY_SYNC_ENABLED || "true").toLowerCase() === "true";
+
+const CLOUDINARY_SYNC_FOLDERS = String(
+  process.env.CLOUDINARY_SYNC_FOLDERS || "autoflow/images,autoflow/videos",
+)
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -115,7 +121,9 @@ function requireSupabaseConfig() {
 
 function requireCloudinaryConfig() {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    throw new Error("Missing Cloudinary environment variables.");
+    throw new Error(
+      "Missing Cloudinary environment variables: CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.",
+    );
   }
 }
 
@@ -190,11 +198,6 @@ function createGraphError(pathValue, errors) {
   return error;
 }
 
-/**
- * مهم:
- * لو التوكن IG/IGA نستخدم graph.instagram.com فقط.
- * لو التوكن EA نستخدم graph.facebook.com أولاً.
- */
 async function graphGet(pathValue, params = {}, options = {}) {
   const token = cleanAccessToken(
     params.access_token ||
@@ -580,6 +583,93 @@ function normalizeMessageType(rawType, hasText) {
   return "unknown";
 }
 
+/**
+ * Safe media insert.
+ * مهم: هذا يحاول يدخل أعمدة إضافية، وإذا قاعدة البيانات قديمة وما فيها الأعمدة، يرجع للإدخال الأساسي.
+ */
+async function insertMediaAssetSafe(payload) {
+  requireSupabaseConfig();
+
+  const { data, error } = await supabase
+    .from("media_assets")
+    .insert(payload)
+    .select()
+    .single();
+
+  if (!error) return data;
+
+  const msg = String(error.message || "");
+  const isSchemaProblem =
+    msg.includes("column") ||
+    msg.includes("schema cache") ||
+    error.code === "PGRST204";
+
+  if (!isSchemaProblem) throw error;
+
+  const fallbackPayload = {
+    media_url: payload.media_url,
+    image_url: payload.image_url || null,
+    video_url: payload.video_url || null,
+    media_type: payload.media_type,
+    mime_type: payload.mime_type || null,
+    file_name: payload.file_name || null,
+    is_uploaded: payload.is_uploaded ?? true,
+    is_scheduled: payload.is_scheduled ?? false,
+    is_published: payload.is_published ?? false,
+  };
+
+  const fallback = await supabase
+    .from("media_assets")
+    .insert(fallbackPayload)
+    .select()
+    .single();
+
+  if (fallback.error) throw fallback.error;
+  return fallback.data;
+}
+
+async function updateMediaAssetSafe(id, payload) {
+  if (!isValidUuid(id)) return null;
+
+  const { data, error } = await supabase
+    .from("media_assets")
+    .update(payload)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (!error) return data;
+
+  const msg = String(error.message || "");
+  const isSchemaProblem =
+    msg.includes("column") ||
+    msg.includes("schema cache") ||
+    error.code === "PGRST204";
+
+  if (!isSchemaProblem) throw error;
+
+  const fallbackPayload = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (payload.is_published !== undefined) fallbackPayload.is_published = payload.is_published;
+  if (payload.published_at !== undefined) fallbackPayload.published_at = payload.published_at;
+  if (payload.is_scheduled !== undefined) fallbackPayload.is_scheduled = payload.is_scheduled;
+  if (payload.scheduled_post_id !== undefined) fallbackPayload.scheduled_post_id = payload.scheduled_post_id;
+  if (payload.caption !== undefined) fallbackPayload.caption = payload.caption;
+  if (payload.hashtags !== undefined) fallbackPayload.hashtags = payload.hashtags;
+
+  const fallback = await supabase
+    .from("media_assets")
+    .update(fallbackPayload)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (fallback.error) throw fallback.error;
+  return fallback.data;
+}
+
 async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
   requireSupabaseConfig();
 
@@ -676,7 +766,16 @@ async function uploadNormalizedImage(file) {
 
   await sharp(file.path)
     .rotate()
-    .jpeg({ quality: 92, mozjpeg: true })
+    .resize({
+      width: 2160,
+      height: 2160,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({
+      quality: 90,
+      mozjpeg: true,
+    })
     .toFile(normalizedPath);
 
   const secureUrl = await uploadImageToCloudinary(normalizedPath);
@@ -704,6 +803,134 @@ async function uploadVideo(file) {
     videoUrl: secureUrl,
     mediaType: "video",
     mimeType: file.mimetype || "video/mp4",
+  };
+}
+
+/**
+ * Cloudinary sync.
+ * يسحب الصور والفيديوهات الموجودة في Cloudinary حتى لو مرفوعة من خارج البرنامج.
+ */
+async function upsertCloudinaryResource(resource) {
+  requireSupabaseConfig();
+
+  const mediaType = resource.resource_type === "video" ? "video" : "image";
+  const mediaUrl = resource.secure_url;
+
+  if (!mediaUrl) {
+    return {
+      status: "failed",
+      error: "Missing secure_url from Cloudinary resource.",
+      resource,
+    };
+  }
+
+  const existing = await supabase
+    .from("media_assets")
+    .select("*")
+    .eq("media_url", mediaUrl)
+    .maybeSingle();
+
+  if (existing.error) throw existing.error;
+
+  if (existing.data) {
+    return {
+      status: "existing",
+      media: existing.data,
+    };
+  }
+
+  const payload = {
+    media_url: mediaUrl,
+    image_url: mediaType === "image" ? mediaUrl : null,
+    video_url: mediaType === "video" ? mediaUrl : null,
+    media_type: mediaType,
+    mime_type: mediaType === "image" ? "image/jpeg" : "video/mp4",
+    file_name: resource.public_id?.split("/").pop() || resource.asset_id || null,
+    is_uploaded: true,
+    is_scheduled: false,
+    is_published: false,
+
+    // Optional columns. إذا مش موجودة، insertMediaAssetSafe بيرجع للإدخال الأساسي.
+    cloudinary_public_id: resource.public_id || null,
+    cloudinary_asset_id: resource.asset_id || null,
+    cloudinary_resource_type: resource.resource_type || null,
+    width: resource.width || null,
+    height: resource.height || null,
+    bytes: resource.bytes || null,
+  };
+
+  const media = await insertMediaAssetSafe(payload);
+
+  return {
+    status: "imported",
+    media,
+  };
+}
+
+async function syncCloudinaryResources() {
+  requireCloudinaryConfig();
+  requireSupabaseConfig();
+
+  if (!CLOUDINARY_SYNC_ENABLED) {
+    return {
+      importedCount: 0,
+      existingCount: 0,
+      failedCount: 0,
+      disabled: true,
+      results: [],
+    };
+  }
+
+  const results = [];
+
+  for (const folder of CLOUDINARY_SYNC_FOLDERS) {
+    for (const resourceType of ["image", "video"]) {
+      let nextCursor = undefined;
+
+      do {
+        try {
+          const response = await cloudinary.api.resources({
+            type: "upload",
+            resource_type: resourceType,
+            prefix: folder,
+            max_results: 100,
+            next_cursor: nextCursor,
+          });
+
+          for (const resource of response.resources || []) {
+            try {
+              const result = await upsertCloudinaryResource(resource);
+              results.push(result);
+            } catch (error) {
+              results.push({
+                status: "failed",
+                folder,
+                resourceType,
+                public_id: resource.public_id,
+                error: error.message || String(error),
+              });
+            }
+          }
+
+          nextCursor = response.next_cursor;
+        } catch (error) {
+          results.push({
+            status: "failed",
+            folder,
+            resourceType,
+            error: error.response?.data || error.message || String(error),
+          });
+          nextCursor = undefined;
+        }
+      } while (nextCursor);
+    }
+  }
+
+  return {
+    importedCount: results.filter((item) => item.status === "imported").length,
+    existingCount: results.filter((item) => item.status === "existing").length,
+    failedCount: results.filter((item) => item.status === "failed").length,
+    results,
   };
 }
 
@@ -1112,38 +1339,30 @@ async function insertAiGeneratedMedia({
   resolution,
   quality,
 }) {
-  requireSupabaseConfig();
+  const media = await insertMediaAssetSafe({
+    media_url: editedImageUrl,
+    image_url: editedImageUrl,
+    video_url: null,
+    media_type: "image",
+    mime_type: "image/jpeg",
+    file_name: "ai-edited-image.jpg",
+    is_uploaded: true,
+    is_scheduled: false,
+    is_published: false,
+    source_media_asset_id: isValidUuid(sourceMediaAssetId) ? sourceMediaAssetId : null,
+    is_ai_generated: true,
+    ai_job_id: isValidUuid(aiJobId) ? aiJobId : null,
+    ai_prompt: prompt,
+    ai_edit_mode: editMode,
+    ai_provider: provider,
+    ai_model: model,
+    ai_aspect_ratio: aspectRatio,
+    ai_output_size: outputSize,
+    ai_resolution: Number(resolution) || null,
+    ai_quality: quality,
+  });
 
-  const { data, error } = await supabase
-    .from("media_assets")
-    .insert({
-      media_url: editedImageUrl,
-      image_url: editedImageUrl,
-      video_url: null,
-      media_type: "image",
-      mime_type: "image/jpeg",
-      file_name: "ai-edited-image.jpg",
-      is_uploaded: true,
-      is_scheduled: false,
-      is_published: false,
-      source_media_asset_id: isValidUuid(sourceMediaAssetId) ? sourceMediaAssetId : null,
-      is_ai_generated: true,
-      ai_job_id: isValidUuid(aiJobId) ? aiJobId : null,
-      ai_prompt: prompt,
-      ai_edit_mode: editMode,
-      ai_provider: provider,
-      ai_model: model,
-      ai_aspect_ratio: aspectRatio,
-      ai_output_size: outputSize,
-      ai_resolution: Number(resolution) || null,
-      ai_quality: quality,
-    })
-    .select()
-    .single();
-
-  if (error) throw error;
-
-  return data;
+  return media;
 }
 
 /**
@@ -1154,14 +1373,11 @@ async function markMediaPublished(mediaAssetId, publishedAt) {
 
   requireSupabaseConfig();
 
-  await supabase
-    .from("media_assets")
-    .update({
-      is_published: true,
-      published_at: publishedAt,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", mediaAssetId);
+  await updateMediaAssetSafe(mediaAssetId, {
+    is_published: true,
+    published_at: publishedAt,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 async function publishScheduledPost(post) {
@@ -1239,7 +1455,7 @@ async function createScheduledPostFromInput(inputBody) {
   }
 
   const caption = normalizeCaption(inputBody);
-  const hashtags = normalizeInputHashtags(inputBody);
+  const tags = normalizeInputHashtags(inputBody);
   const scheduledAt = normalizeScheduledAt(inputBody);
 
   if (!mediaUrl || !scheduledAt) {
@@ -1264,7 +1480,7 @@ async function createScheduledPostFromInput(inputBody) {
     throw error;
   }
 
-  const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
+  const finalText = `${caption}\n${tags.join(" ")}`.trim();
 
   const { data: post, error } = await supabase
     .from("scheduled_posts")
@@ -1275,7 +1491,7 @@ async function createScheduledPostFromInput(inputBody) {
       video_url: videoUrl,
       media_type: mediaType,
       caption,
-      hashtags,
+      hashtags: tags,
       final_text: finalText,
       scheduled_at: parsedDate.toISOString(),
       status: "approved",
@@ -1286,14 +1502,11 @@ async function createScheduledPostFromInput(inputBody) {
   if (error) throw error;
 
   if (mediaAssetId && isValidUuid(mediaAssetId)) {
-    await supabase
-      .from("media_assets")
-      .update({
-        is_scheduled: true,
-        scheduled_post_id: post.id,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", mediaAssetId);
+    await updateMediaAssetSafe(mediaAssetId, {
+      is_scheduled: true,
+      scheduled_post_id: post.id,
+      updated_at: new Date().toISOString(),
+    });
   }
 
   return post;
@@ -1559,7 +1772,7 @@ function autoReplyRuleMatches(rule, commentText) {
   if (rule.trigger_type === "any_comment") return true;
 
   const keywords = Array.isArray(rule.keywords)
-    ? rule.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean)
+    ? rule.keywords.map((keyword) => String(keyword).toLowerCase().trim()).filter(Boolean)
     : [];
 
   if (keywords.length === 0) return false;
@@ -1621,31 +1834,6 @@ async function applyAutoReplyRulesToComment(commentRow) {
   for (const rule of rules || []) {
     if (!autoReplyRuleMatches(rule, commentRow.text)) continue;
 
-    if (rule.only_once_per_user && commentRow.user_id) {
-      const { data: existingLog } = await supabase
-        .from("ig_auto_reply_logs")
-        .select("id")
-        .eq("rule_id", rule.id)
-        .eq("user_id", commentRow.user_id)
-        .eq("status", "sent")
-        .maybeSingle();
-
-      if (existingLog) {
-        await supabase.from("ig_auto_reply_logs").insert({
-          rule_id: rule.id,
-          ig_comment_id: commentRow.ig_comment_id,
-          ig_media_id: commentRow.ig_media_id,
-          username: commentRow.username,
-          user_id: commentRow.user_id,
-          reply_mode: rule.reply_mode,
-          status: "skipped",
-          message_text: "Skipped because only_once_per_user is enabled.",
-        });
-
-        continue;
-      }
-    }
-
     try {
       if (
         (rule.reply_mode === "public_reply" || rule.reply_mode === "both") &&
@@ -1668,10 +1856,7 @@ async function applyAutoReplyRulesToComment(commentRow) {
         username: commentRow.username,
         user_id: commentRow.user_id,
         reply_mode: rule.reply_mode,
-        message_text:
-          rule.reply_mode === "public_reply"
-            ? rule.public_reply_text
-            : rule.private_reply_text || rule.public_reply_text,
+        message_text: rule.private_reply_text || rule.public_reply_text,
         status: "sent",
       });
     } catch (replyError) {
@@ -1682,10 +1867,7 @@ async function applyAutoReplyRulesToComment(commentRow) {
         username: commentRow.username,
         user_id: commentRow.user_id,
         reply_mode: rule.reply_mode,
-        message_text:
-          rule.reply_mode === "public_reply"
-            ? rule.public_reply_text
-            : rule.private_reply_text || rule.public_reply_text,
+        message_text: rule.private_reply_text || rule.public_reply_text,
         status: "failed",
         error_message: replyError.response?.data
           ? JSON.stringify(replyError.response.data)
@@ -1791,7 +1973,6 @@ async function insertInboundMessageFromWebhook(messagingEvent) {
     if (error) console.warn("Inbound message upsert failed:", error.message);
   } else {
     const { error } = await supabase.from("ig_messages").insert(payload);
-
     if (error) console.warn("Inbound message insert failed:", error.message);
   }
 }
@@ -1806,8 +1987,8 @@ function extractParticipant(conversation) {
   if (!Array.isArray(candidates)) return null;
 
   return (
-    candidates.find((p) => {
-      const id = String(p.id || "");
+    candidates.find((participant) => {
+      const id = String(participant.id || "");
       return id !== String(IG_USER_ID) && id !== String(FACEBOOK_PAGE_ID);
     }) ||
     candidates[0] ||
@@ -2106,6 +2287,8 @@ app.get("/", (_req, res) => {
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET,
     ),
+    cloudinarySyncEnabled: CLOUDINARY_SYNC_ENABLED,
+    cloudinarySyncFolders: CLOUDINARY_SYNC_FOLDERS,
     aiStudio: true,
     instagramLoginMode: hasInstagramTokenConfig(),
     inboxEnabled: hasInstagramTokenConfig() || hasPageTokenConfig(),
@@ -2131,6 +2314,8 @@ app.get("/api/health", (_req, res) => {
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET,
     ),
+    cloudinarySyncEnabled: CLOUDINARY_SYNC_ENABLED,
+    cloudinarySyncFolders: CLOUDINARY_SYNC_FOLDERS,
     aiStudio: true,
     instagramLoginMode: hasInstagramTokenConfig(),
     inboxEnabled: hasInstagramTokenConfig() || hasPageTokenConfig(),
@@ -2227,6 +2412,35 @@ app.post("/api/webhooks/meta", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: error.response?.data || error.details || error.message,
+    });
+  }
+});
+
+app.post("/api/cloudinary/webhook", async (req, res) => {
+  try {
+    requireCloudinaryConfig();
+    requireSupabaseConfig();
+
+    const body = req.body || {};
+
+    if (!body.secure_url) {
+      return res.json({
+        ok: true,
+        ignored: true,
+        reason: "Missing secure_url in Cloudinary webhook body.",
+      });
+    }
+
+    const result = await upsertCloudinaryResource(body);
+
+    res.json({
+      ok: true,
+      result,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message || String(error),
     });
   }
 });
@@ -2374,85 +2588,165 @@ app.post("/api/meta/test-connection", async (req, res) => {
 });
 
 /**
- * Media upload / library.
+ * Cloudinary sync endpoints.
  */
-app.post("/api/upload", upload.any(), async (req, res) => {
+app.get("/api/cloudinary/sync", async (_req, res) => {
   try {
-    requireCloudinaryConfig();
-    requireSupabaseConfig();
-
-    const file = req.files?.[0];
-
-    if (!file) {
-      return res.status(400).json({
-        ok: false,
-        error: "No media file uploaded.",
-      });
-    }
-
-    const mediaType = detectMediaTypeFromFile(file);
-
-    if (!mediaType) {
-      cleanupFile(file.path);
-      return res.status(400).json({
-        ok: false,
-        error: "Unsupported file type. Upload image or video only.",
-      });
-    }
-
-    const uploaded =
-      mediaType === "image" ? await uploadNormalizedImage(file) : await uploadVideo(file);
-
-    const { data: media, error } = await supabase
-      .from("media_assets")
-      .insert({
-        media_url: uploaded.mediaUrl,
-        image_url: uploaded.imageUrl,
-        video_url: uploaded.videoUrl,
-        media_type: uploaded.mediaType,
-        mime_type: uploaded.mimeType,
-        file_name: file.originalname || null,
-        is_uploaded: true,
-        is_scheduled: false,
-        is_published: false,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
+    const result = await syncCloudinaryResources();
     res.json({
       ok: true,
-      media: withAliases(media),
-      url: uploaded.mediaUrl,
-      mediaUrl: uploaded.mediaUrl,
-      media_url: uploaded.mediaUrl,
-      imageUrl: uploaded.imageUrl,
-      image_url: uploaded.imageUrl,
-      videoUrl: uploaded.videoUrl,
-      video_url: uploaded.videoUrl,
-      mediaType: uploaded.mediaType,
-      media_type: uploaded.mediaType,
-      mimeType: uploaded.mimeType,
-      mime_type: uploaded.mimeType,
+      ...result,
     });
   } catch (error) {
-    console.error("Upload failed:", error.response?.data || error.message);
-
-    if (req.files) {
-      for (const file of req.files) cleanupFile(file.path);
-    }
-
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message,
+      error: error.response?.data || error.message || String(error),
     });
   }
 });
 
-app.get("/api/media", async (_req, res) => {
+app.post("/api/cloudinary/sync", async (_req, res) => {
+  try {
+    const result = await syncCloudinaryResources();
+    res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message || String(error),
+    });
+  }
+});
+
+/**
+ * Media upload / library.
+ */
+app.post("/api/upload", upload.any(), async (req, res) => {
+  const uploadedFiles = [];
+
+  try {
+    requireCloudinaryConfig();
+    requireSupabaseConfig();
+
+    const files = req.files || [];
+
+    if (files.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "No media file uploaded. Send multipart/form-data with file field.",
+      });
+    }
+
+    for (const file of files) {
+      try {
+        console.log("Uploading file:", {
+          originalname: file.originalname,
+          mimetype: file.mimetype,
+          size: file.size,
+        });
+
+        const mediaType = detectMediaTypeFromFile(file);
+
+        if (!mediaType) {
+          cleanupFile(file.path);
+
+          uploadedFiles.push({
+            ok: false,
+            fileName: file.originalname || null,
+            error: "Unsupported file type. Upload image or video only.",
+          });
+
+          continue;
+        }
+
+        const uploaded =
+          mediaType === "image" ? await uploadNormalizedImage(file) : await uploadVideo(file);
+
+        const media = await insertMediaAssetSafe({
+          media_url: uploaded.mediaUrl,
+          image_url: uploaded.imageUrl,
+          video_url: uploaded.videoUrl,
+          media_type: uploaded.mediaType,
+          mime_type: uploaded.mimeType,
+          file_name: file.originalname || null,
+          is_uploaded: true,
+          is_scheduled: false,
+          is_published: false,
+        });
+
+        uploadedFiles.push({
+          ok: true,
+          fileName: file.originalname || null,
+          media: withAliases(media),
+          url: uploaded.mediaUrl,
+          mediaUrl: uploaded.mediaUrl,
+          media_url: uploaded.mediaUrl,
+          imageUrl: uploaded.imageUrl,
+          image_url: uploaded.imageUrl,
+          videoUrl: uploaded.videoUrl,
+          video_url: uploaded.videoUrl,
+          mediaType: uploaded.mediaType,
+          media_type: uploaded.mediaType,
+          mimeType: uploaded.mimeType,
+          mime_type: uploaded.mimeType,
+        });
+      } catch (fileError) {
+        cleanupFile(file.path);
+
+        uploadedFiles.push({
+          ok: false,
+          fileName: file.originalname || null,
+          error: fileError.response?.data || fileError.message || String(fileError),
+        });
+      }
+    }
+
+    const success = uploadedFiles.filter((item) => item.ok);
+    const failed = uploadedFiles.filter((item) => !item.ok);
+
+    if (files.length === 1 && success.length === 1) {
+      return res.json({
+        ok: true,
+        ...success[0],
+      });
+    }
+
+    return res.status(failed.length > 0 ? 207 : 200).json({
+      ok: failed.length === 0,
+      uploadedCount: success.length,
+      failedCount: failed.length,
+      media: success.map((item) => item.media),
+      data: success.map((item) => item.media),
+      items: success.map((item) => item.media),
+      results: uploadedFiles,
+    });
+  } catch (error) {
+    console.error("Upload failed:", error.response?.data || error.stack || error.message);
+
+    if (req.files) {
+      for (const file of req.files) {
+        cleanupFile(file.path);
+      }
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message || String(error),
+    });
+  }
+});
+
+app.get("/api/media", async (req, res) => {
   try {
     requireSupabaseConfig();
+
+    let cloudinarySync = null;
+
+    if (req.query.syncCloudinary === "true") {
+      cloudinarySync = await syncCloudinaryResources();
+    }
 
     const { data, error } = await supabase
       .from("media_assets")
@@ -2469,6 +2763,7 @@ app.get("/api/media", async (_req, res) => {
       data: rows,
       items: rows,
       count: rows.length,
+      cloudinarySync,
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
@@ -2565,14 +2860,11 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
     const mediaAssetId = req.body.mediaAssetId || req.body.media_asset_id;
 
     if (isValidUuid(mediaAssetId)) {
-      await supabase
-        .from("media_assets")
-        .update({
-          caption: result.caption,
-          hashtags: result.hashtags,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", mediaAssetId);
+      await updateMediaAssetSafe(mediaAssetId, {
+        caption: result.caption,
+        hashtags: result.hashtags,
+        updated_at: new Date().toISOString(),
+      });
     }
 
     res.json({ ok: true, result });
@@ -2633,26 +2925,32 @@ app.post("/api/ai/edit-image", async (req, res) => {
       userPrompt,
     });
 
-    const { data: job, error: jobError } = await supabase
-      .from("ai_jobs")
-      .insert({
-        job_type: "single_edit",
-        status: "processing",
-        total_items: 1,
-        completed_items: 0,
-        failed_items: 0,
-        provider: "gemini",
-        model,
-        edit_mode: editMode,
-        aspect_ratio: aspectRatio,
-        output_size: outputSize,
-        resolution,
-        quality,
-      })
-      .select()
-      .single();
+    let job = null;
 
-    if (jobError) throw jobError;
+    try {
+      const { data, error } = await supabase
+        .from("ai_jobs")
+        .insert({
+          job_type: "single_edit",
+          status: "processing",
+          total_items: 1,
+          completed_items: 0,
+          failed_items: 0,
+          provider: "gemini",
+          model,
+          edit_mode: editMode,
+          aspect_ratio: aspectRatio,
+          output_size: outputSize,
+          resolution,
+          quality,
+        })
+        .select()
+        .single();
+
+      if (!error) job = data;
+    } catch {
+      job = null;
+    }
 
     const result = await editImageWithGemini({
       originalImageUrl,
@@ -2663,7 +2961,7 @@ app.post("/api/ai/edit-image", async (req, res) => {
     const savedMedia = await insertAiGeneratedMedia({
       editedImageUrl: result.editedImageUrl,
       sourceMediaAssetId: mediaAssetId,
-      aiJobId: job.id,
+      aiJobId: job?.id || null,
       prompt: finalPrompt,
       editMode,
       provider: "gemini",
@@ -2674,19 +2972,21 @@ app.post("/api/ai/edit-image", async (req, res) => {
       quality,
     });
 
-    await supabase
-      .from("ai_jobs")
-      .update({
-        status: "completed",
-        completed_items: 1,
-        failed_items: 0,
-      })
-      .eq("id", job.id);
+    if (job?.id) {
+      await supabase
+        .from("ai_jobs")
+        .update({
+          status: "completed",
+          completed_items: 1,
+          failed_items: 0,
+        })
+        .eq("id", job.id);
+    }
 
     res.json({
       ok: true,
       result: {
-        jobId: job.id,
+        jobId: job?.id || null,
         editedImageUrl: result.editedImageUrl,
         savedMediaAssetId: savedMedia?.id || null,
         media: withAliases(savedMedia),
@@ -2704,15 +3004,18 @@ app.get("/api/ai/results", async (_req, res) => {
   try {
     requireSupabaseConfig();
 
-    const { data, error } = await supabase
+    let query = supabase
       .from("media_assets")
       .select("*")
-      .eq("is_ai_generated", true)
       .order("created_at", { ascending: false });
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
-    const rows = (data || []).map(withAliases);
+    const rows = (data || [])
+      .filter((item) => item.is_ai_generated === true)
+      .map(withAliases);
 
     res.json({
       ok: true,
@@ -2794,18 +3097,9 @@ app.post("/api/comments/sync-all", async (_req, res) => {
   }
 });
 
-/**
- * مهم: GET فقط للدباگ، لأن بعض أزرار Flutter كانت تنادي sync بالغلط كـ GET.
- */
 app.get("/api/comments/sync-all", async (_req, res) => {
   try {
     const result = await runCommentsSyncAll();
-
-    console.log("GET /api/comments/sync-all result:", {
-      mediaCount: result.mediaCount,
-      commentsCount: result.commentsCount,
-      errorsCount: result.errors?.length || 0,
-    });
 
     res.json({
       ok: true,
@@ -2814,8 +3108,6 @@ app.get("/api/comments/sync-all", async (_req, res) => {
       ...result,
     });
   } catch (error) {
-    console.error("GET comments sync failed:", error.details || error.response?.data || error.message);
-
     res.status(500).json({
       ok: false,
       error: error.details || error.response?.data || error.message,
@@ -3067,19 +3359,11 @@ app.post("/api/inbox/sync-instagram", async (_req, res) => {
   try {
     const result = await syncInstagramConversations();
 
-    console.log("POST /api/inbox/sync-instagram result:", {
-      conversationsCount: result.conversationsCount,
-      messagesCount: result.messagesCount,
-      errorsCount: result.errors?.length || 0,
-    });
-
     res.json({
       ok: true,
       ...result,
     });
   } catch (error) {
-    console.error("POST inbox sync failed:", error.details || error.response?.data || error.message);
-
     res.status(500).json({
       ok: false,
       requiresPageToken: true,
@@ -3088,18 +3372,9 @@ app.post("/api/inbox/sync-instagram", async (_req, res) => {
   }
 });
 
-/**
- * مهم: GET فقط للدباگ، لأن بعض أزرار Flutter كانت تنادي sync بالغلط كـ GET.
- */
 app.get("/api/inbox/sync-instagram", async (_req, res) => {
   try {
     const result = await syncInstagramConversations();
-
-    console.log("GET /api/inbox/sync-instagram result:", {
-      conversationsCount: result.conversationsCount,
-      messagesCount: result.messagesCount,
-      errorsCount: result.errors?.length || 0,
-    });
 
     res.json({
       ok: true,
@@ -3108,8 +3383,6 @@ app.get("/api/inbox/sync-instagram", async (_req, res) => {
       ...result,
     });
   } catch (error) {
-    console.error("GET inbox sync failed:", error.details || error.response?.data || error.message);
-
     res.status(500).json({
       ok: false,
       requiresPageToken: true,
