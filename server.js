@@ -38,6 +38,11 @@ const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
+const DEFAULT_BUSINESS_NAME = process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
+const DEFAULT_LOCATION = process.env.DEFAULT_LOCATION || "UAE";
+const DEFAULT_CTA = process.env.DEFAULT_CTA || "Contact us today";
+const DEFAULT_HASHTAG_COUNT = Number(process.env.DEFAULT_HASHTAG_COUNT || 10);
+
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
@@ -733,6 +738,122 @@ async function publishToInstagram({
   };
 }
 
+function getPresetInstruction(captionPreset, customPrompt) {
+  const preset = String(captionPreset || "Luxury Product Caption").trim();
+
+  if (preset === "Custom Prompt") {
+    return customPrompt && String(customPrompt).trim()
+      ? String(customPrompt).trim()
+      : "Write a premium Instagram caption based on the visible product and scene.";
+  }
+
+  const presets = {
+    "Luxury Product Caption":
+      "Focus on premium decor, elegance, high-end styling, luxury ambience, and refined taste.",
+    "Artificial Tree Marketing":
+      "Focus on realistic artificial trees, no maintenance, custom sizes, greenery styling, and indoor/outdoor decor.",
+    "Artificial Flower Arrangement":
+      "Focus on flower colors, arrangement style, luxury floral styling, events, interiors, and decorative impact.",
+    "Interior Design Decor":
+      "Focus on how the product improves the interior space, ambience, warmth, balance, and luxury decor.",
+    "Villa / Entrance Decor":
+      "Focus on villa entrances, majlis, welcoming first impression, elegant greenery, and premium home decor.",
+    "Hotel / Mall / Commercial Decor":
+      "Focus on commercial spaces, hotels, malls, offices, durability, visual impact, and professional installation.",
+    "Short Premium Caption":
+      "Write one short, elegant, direct caption. Keep it premium and minimal.",
+    "Arabic Social Media Caption":
+      "Write natural Arabic social media copy. Make it premium but not stiff or over-formal.",
+    "Before / After Style":
+      "Write like a transformation post. Emphasize how the decor changes the feeling of the space."
+  };
+
+  return presets[preset] || presets["Luxury Product Caption"];
+}
+
+function buildCaptionPrompt({
+  language,
+  tone,
+  captionPreset,
+  customPrompt,
+  businessName,
+  location,
+  cta,
+  hashtagCount
+}) {
+  const presetInstruction = getPresetInstruction(captionPreset, customPrompt);
+  const safeHashtagCount = Number.isFinite(Number(hashtagCount))
+    ? Math.max(3, Math.min(25, Number(hashtagCount)))
+    : DEFAULT_HASHTAG_COUNT;
+
+  return `
+You are a senior Instagram marketing copywriter for ${businessName}, a ${location}-based company specializing in premium artificial trees, artificial flowers, custom greenery, and luxury decor installations.
+
+Analyze the image carefully before writing.
+
+Identify what is visible:
+- Is it an artificial tree, flowers, greenery wall, planter, staircase decor, entrance decor, villa decor, commercial decor, or another product?
+- What colors are visible?
+- What style does the space or product suggest?
+- Is it luxury, modern, natural, minimal, classic, or commercial?
+- What customer would want this?
+- What is the strongest marketing angle?
+
+Caption preset:
+${captionPreset}
+
+Preset instruction:
+${presetInstruction}
+
+Language:
+${language}
+
+Tone:
+${tone}
+
+Business name:
+${businessName}
+
+Location:
+${location}
+
+CTA:
+${cta}
+
+Hashtag count:
+${safeHashtagCount}
+
+Write a caption that matches the actual visible image, not a generic caption.
+
+Return strict JSON only:
+{
+  "caption": "caption here",
+  "hashtags": ["#hashtag1", "#hashtag2"],
+  "alt_text": "short alt text",
+  "detected_product": "what the image shows",
+  "visual_description": "short visual analysis",
+  "marketing_angle": "main sales angle"
+}
+
+Rules:
+- Caption must be specific to the image.
+- Do not use placeholders.
+- Do not write "#hashtag1".
+- Do not invent discounts, offers, guarantees, or prices.
+- Do not mention AI.
+- Do not say "in the image" unless it is necessary.
+- Mention artificial tree / artificial flowers only when visually relevant.
+- If the product looks like an artificial olive tree, mention artificial olive tree.
+- If the product looks like flowers, mention floral arrangement, colors, and styling.
+- If the setting looks like an entrance, staircase, villa, hotel, mall, showroom, or commercial decor, mention that appropriately.
+- Hashtags must be relevant to UAE decor, artificial trees, artificial flowers, interiors, villas, hotels, landscaping, or the detected product.
+- Use no more than ${safeHashtagCount} hashtags.
+- Arabic captions must sound natural, premium, and social-media-ready, not literal translation.
+- English captions must be clean, premium, and concise.
+- If language is Arabic + English, write a short Arabic caption followed by a short English line.
+`;
+}
+
 async function generateTextWithGemini(
   prompt,
   modelName = GEMINI_TEXT_MODEL,
@@ -751,7 +872,8 @@ async function generateCaptionWithGeminiVision({
   imageUrl,
   prompt,
   modelName = GEMINI_TEXT_MODEL,
-  apiKey = GEMINI_API_KEY
+  apiKey = GEMINI_API_KEY,
+  fallbackTextOnly = false
 }) {
   requireGeminiConfig(apiKey);
 
@@ -763,7 +885,12 @@ async function generateCaptionWithGeminiVision({
     const result = await model.generateContent([prompt, imagePart]);
     return result.response.text();
   } catch (error) {
-    console.warn("Gemini vision fallback to text-only:", error.message);
+    console.error("Gemini image analysis failed:", error.response?.data || error.message);
+
+    if (!fallbackTextOnly) {
+      throw new Error("Could not fetch image for visual analysis.");
+    }
+
     const result = await model.generateContent(`${prompt}\n\nImage URL: ${imageUrl}`);
     return result.response.text();
   }
@@ -774,25 +901,8 @@ async function generateCaptionWithOpenAI({
   apiKey,
   model,
   imageUrl,
-  language,
-  tone
+  prompt
 }) {
-  const prompt = `
-You are a social media marketing assistant for artificial trees, artificial flowers, luxury interior decor, and premium visual marketing.
-
-Generate Instagram content.
-
-Language: ${language}
-Tone: ${tone}
-
-Return strict JSON only:
-{
-  "caption": "short marketing caption",
-  "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5", "#tag6", "#tag7", "#tag8"],
-  "alt_text": "short alt text"
-}
-`;
-
   const endpoint =
     provider === "openrouter"
       ? "https://openrouter.ai/api/v1/chat/completions"
@@ -838,7 +948,14 @@ async function generateCaptionWithAI({
   imageUrl,
   language = "arabic",
   tone = "premium",
-  model
+  model,
+  captionPreset = "Luxury Product Caption",
+  customPrompt = "",
+  businessName = DEFAULT_BUSINESS_NAME,
+  location = DEFAULT_LOCATION,
+  cta = DEFAULT_CTA,
+  hashtagCount = DEFAULT_HASHTAG_COUNT,
+  fallbackTextOnly = false
 }) {
   const selectedProvider = normalizeProvider(provider);
   const selectedApiKey = getProviderApiKey({
@@ -850,24 +967,16 @@ async function generateCaptionWithAI({
     throw new Error(`Missing API key for provider: ${selectedProvider}`);
   }
 
-  const prompt = `
-You are a social media marketing assistant for artificial trees, artificial flowers, luxury interior decor, and premium visual marketing.
-
-Analyze the provided product media and generate Instagram content.
-
-Language:
-${language}
-
-Tone:
-${tone}
-
-Return strict JSON only:
-{
-  "caption": "short marketing caption",
-  "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5", "#tag6", "#tag7", "#tag8"],
-  "alt_text": "short alt text"
-}
-`;
+  const prompt = buildCaptionPrompt({
+    language,
+    tone,
+    captionPreset,
+    customPrompt,
+    businessName,
+    location,
+    cta,
+    hashtagCount
+  });
 
   let text = "";
 
@@ -876,7 +985,8 @@ Return strict JSON only:
       imageUrl,
       prompt,
       modelName: model || GEMINI_TEXT_MODEL,
-      apiKey: selectedApiKey
+      apiKey: selectedApiKey,
+      fallbackTextOnly
     });
   } else {
     text = await generateCaptionWithOpenAI({
@@ -884,8 +994,7 @@ Return strict JSON only:
       apiKey: selectedApiKey,
       model,
       imageUrl,
-      language,
-      tone
+      prompt
     });
   }
 
@@ -895,14 +1004,20 @@ Return strict JSON only:
     return {
       caption: parsed.caption || "",
       hashtags: normalizeHashtags(parsed.hashtags),
-      alt_text: parsed.alt_text || ""
+      alt_text: parsed.alt_text || "",
+      detected_product: parsed.detected_product || "",
+      visual_description: parsed.visual_description || "",
+      marketing_angle: parsed.marketing_angle || ""
     };
   }
 
   return {
     caption: text,
     hashtags: [],
-    alt_text: ""
+    alt_text: "",
+    detected_product: "",
+    visual_description: "",
+    marketing_angle: ""
   };
 }
 
@@ -942,7 +1057,8 @@ Return strict JSON only:
     imageUrl,
     prompt,
     modelName: model,
-    apiKey
+    apiKey,
+    fallbackTextOnly: false
   });
 
   const parsed = parseJsonLoose(text);
@@ -1753,8 +1869,28 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
       imageUrl,
       language: req.body.language || "arabic",
       tone: req.body.tone || "premium",
-      model: req.body.model || GEMINI_TEXT_MODEL
+      model: req.body.model || GEMINI_TEXT_MODEL,
+      captionPreset: req.body.captionPreset || req.body.caption_preset || "Luxury Product Caption",
+      customPrompt: req.body.customPrompt || req.body.custom_prompt || "",
+      businessName: req.body.businessName || req.body.business_name || DEFAULT_BUSINESS_NAME,
+      location: req.body.location || DEFAULT_LOCATION,
+      cta: req.body.cta || DEFAULT_CTA,
+      hashtagCount: req.body.hashtagCount || req.body.hashtag_count || DEFAULT_HASHTAG_COUNT,
+      fallbackTextOnly: req.body.fallbackTextOnly === true
     });
+
+    const mediaAssetId = req.body.mediaAssetId || req.body.media_asset_id;
+
+    if (isValidUuid(mediaAssetId)) {
+      await supabase
+        .from("media_assets")
+        .update({
+          caption: result.caption,
+          hashtags: result.hashtags,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", mediaAssetId);
+    }
 
     res.json({
       ok: true,
