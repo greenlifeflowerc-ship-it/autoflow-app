@@ -30,9 +30,10 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const IG_GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
+const INSTAGRAM_GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
 const META_GRAPH_HOST = process.env.META_GRAPH_HOST || "https://graph.facebook.com";
-const GRAPH_VERSION = process.env.GRAPH_VERSION || process.env.META_GRAPH_VERSION || "v25.0";
+const GRAPH_VERSION =
+  process.env.GRAPH_VERSION || process.env.META_GRAPH_VERSION || "v25.0";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const IG_USER_ID = process.env.IG_USER_ID;
@@ -43,7 +44,8 @@ const META_WEBHOOK_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN;
 const FACEBOOK_PAGE_ID = process.env.FACEBOOK_PAGE_ID;
 const FACEBOOK_PAGE_ACCESS_TOKEN = process.env.FACEBOOK_PAGE_ACCESS_TOKEN;
 
-const AUTO_REPLY_ENABLED = String(process.env.AUTO_REPLY_ENABLED || "false").toLowerCase() === "true";
+const AUTO_REPLY_ENABLED =
+  String(process.env.AUTO_REPLY_ENABLED || "false").toLowerCase() === "true";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -121,30 +123,156 @@ function requireMetaPublishConfig() {
   }
 }
 
-function requirePageMessagingConfig() {
-  if (!FACEBOOK_PAGE_ID || !FACEBOOK_PAGE_ACCESS_TOKEN) {
-    throw new Error("Missing FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN.");
-  }
-}
-
 function requireGeminiConfig(apiKey = GEMINI_API_KEY) {
   if (!apiKey) {
     throw new Error("Missing GEMINI_API_KEY.");
   }
 }
 
-function metaUrl(pathValue) {
-  const cleanPath = String(pathValue).startsWith("/")
-    ? String(pathValue)
-    : `/${pathValue}`;
-  return `${META_GRAPH_HOST}/${GRAPH_VERSION}${cleanPath}`;
+function hasInstagramTokenConfig() {
+  return Boolean(META_ACCESS_TOKEN && IG_USER_ID);
 }
 
-function igUrl(pathValue) {
+function hasPageTokenConfig() {
+  return Boolean(FACEBOOK_PAGE_ID && FACEBOOK_PAGE_ACCESS_TOKEN);
+}
+
+function buildGraphUrl(host, pathValue) {
   const cleanPath = String(pathValue).startsWith("/")
     ? String(pathValue)
     : `/${pathValue}`;
-  return `${IG_GRAPH_HOST}/${GRAPH_VERSION}${cleanPath}`;
+
+  return `${host}/${GRAPH_VERSION}${cleanPath}`;
+}
+
+function instagramGraphUrl(pathValue) {
+  return buildGraphUrl(INSTAGRAM_GRAPH_HOST, pathValue);
+}
+
+function metaGraphUrl(pathValue) {
+  return buildGraphUrl(META_GRAPH_HOST, pathValue);
+}
+
+function createCombinedGraphError(pathValue, instagramError, metaError) {
+  const message = {
+    message: `Graph request failed on both Instagram Graph and Meta Graph for ${pathValue}.`,
+    instagramGraphError: instagramError?.response?.data || instagramError?.message || null,
+    metaGraphError: metaError?.response?.data || metaError?.message || null,
+  };
+
+  const error = new Error(message.message);
+  error.details = message;
+  return error;
+}
+
+async function graphGetWithFallback(pathValue, params = {}, options = {}) {
+  const mergedParams = {
+    ...params,
+    access_token: params.access_token || META_ACCESS_TOKEN,
+  };
+
+  let instagramError = null;
+  let metaError = null;
+
+  if (options.preferMeta !== true) {
+    try {
+      return await axios.get(instagramGraphUrl(pathValue), {
+        params: mergedParams,
+        timeout: options.timeout || 30000,
+      });
+    } catch (error) {
+      instagramError = error;
+      console.warn(
+        `Instagram Graph GET failed ${pathValue}:`,
+        error.response?.data || error.message,
+      );
+    }
+  }
+
+  try {
+    return await axios.get(metaGraphUrl(pathValue), {
+      params: mergedParams,
+      timeout: options.timeout || 30000,
+    });
+  } catch (error) {
+    metaError = error;
+    console.warn(
+      `Meta Graph GET failed ${pathValue}:`,
+      error.response?.data || error.message,
+    );
+  }
+
+  if (options.preferMeta === true) {
+    try {
+      return await axios.get(instagramGraphUrl(pathValue), {
+        params: mergedParams,
+        timeout: options.timeout || 30000,
+      });
+    } catch (error) {
+      instagramError = error;
+      console.warn(
+        `Instagram Graph GET fallback failed ${pathValue}:`,
+        error.response?.data || error.message,
+      );
+    }
+  }
+
+  throw createCombinedGraphError(pathValue, instagramError, metaError);
+}
+
+async function graphPostWithFallback(pathValue, data = null, params = {}, options = {}) {
+  const mergedParams = {
+    ...params,
+    access_token: params.access_token || META_ACCESS_TOKEN,
+  };
+
+  let instagramError = null;
+  let metaError = null;
+
+  if (options.preferMeta !== true) {
+    try {
+      return await axios.post(instagramGraphUrl(pathValue), data, {
+        params: mergedParams,
+        timeout: options.timeout || 30000,
+      });
+    } catch (error) {
+      instagramError = error;
+      console.warn(
+        `Instagram Graph POST failed ${pathValue}:`,
+        error.response?.data || error.message,
+      );
+    }
+  }
+
+  try {
+    return await axios.post(metaGraphUrl(pathValue), data, {
+      params: mergedParams,
+      timeout: options.timeout || 30000,
+    });
+  } catch (error) {
+    metaError = error;
+    console.warn(
+      `Meta Graph POST failed ${pathValue}:`,
+      error.response?.data || error.message,
+    );
+  }
+
+  if (options.preferMeta === true) {
+    try {
+      return await axios.post(instagramGraphUrl(pathValue), data, {
+        params: mergedParams,
+        timeout: options.timeout || 30000,
+      });
+    } catch (error) {
+      instagramError = error;
+      console.warn(
+        `Instagram Graph POST fallback failed ${pathValue}:`,
+        error.response?.data || error.message,
+      );
+    }
+  }
+
+  throw createCombinedGraphError(pathValue, instagramError, metaError);
 }
 
 function cleanupFile(filePath) {
@@ -227,11 +355,7 @@ function detectMediaTypeFromUrl(url) {
     return "image";
   }
 
-  if (
-    clean.endsWith(".mp4") ||
-    clean.endsWith(".mov") ||
-    clean.endsWith(".m4v")
-  ) {
+  if (clean.endsWith(".mp4") || clean.endsWith(".mov") || clean.endsWith(".m4v")) {
     return "video";
   }
 
@@ -403,6 +527,15 @@ function withAliases(row) {
     isAiGenerated: row.is_ai_generated ?? row.isAiGenerated,
     isPublished: row.is_published ?? row.isPublished,
     isScheduled: row.is_scheduled ?? row.isScheduled,
+    conversationId: row.conversation_id ?? row.conversationId,
+    igScopedUserId: row.ig_scoped_user_id ?? row.igScopedUserId,
+    metaConversationId: row.meta_conversation_id ?? row.metaConversationId,
+    lastMessageText: row.last_message_text ?? row.lastMessageText,
+    lastMessageAt: row.last_message_at ?? row.lastMessageAt,
+    unreadCount: row.unread_count ?? row.unreadCount,
+    messageType: row.message_type ?? row.messageType,
+    mediaUrl: row.media_url ?? row.mediaUrl,
+    sentAt: row.sent_at ?? row.sentAt,
   };
 }
 
@@ -510,10 +643,7 @@ async function uploadNormalizedImage(file) {
 
   await sharp(file.path)
     .rotate()
-    .jpeg({
-      quality: 92,
-      mozjpeg: true,
-    })
+    .jpeg({ quality: 92, mozjpeg: true })
     .toFile(normalizedPath);
 
   const secureUrl = await uploadImageToCloudinary(normalizedPath);
@@ -544,15 +674,12 @@ async function uploadVideo(file) {
   };
 }
 
-/**
- * INSTAGRAM PUBLISH
- */
 async function pollMediaContainerStatus(containerId) {
   await sleep(3000);
 
   for (let attempt = 1; attempt <= 24; attempt += 1) {
     try {
-      const response = await axios.get(igUrl(`/${containerId}`), {
+      const response = await axios.get(instagramGraphUrl(`/${containerId}`), {
         params: {
           fields: "status_code,status",
           access_token: META_ACCESS_TOKEN,
@@ -608,10 +735,14 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
     params.media_type = "VIDEO";
   }
 
-  const containerResponse = await axios.post(igUrl(`/${IG_USER_ID}/media`), null, {
-    params,
-    timeout: 60000,
-  });
+  const containerResponse = await axios.post(
+    instagramGraphUrl(`/${IG_USER_ID}/media`),
+    null,
+    {
+      params,
+      timeout: 60000,
+    },
+  );
 
   const creationId = containerResponse.data?.id;
 
@@ -625,13 +756,17 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      publishResponse = await axios.post(igUrl(`/${IG_USER_ID}/media_publish`), null, {
-        params: {
-          creation_id: creationId,
-          access_token: META_ACCESS_TOKEN,
+      publishResponse = await axios.post(
+        instagramGraphUrl(`/${IG_USER_ID}/media_publish`),
+        null,
+        {
+          params: {
+            creation_id: creationId,
+            access_token: META_ACCESS_TOKEN,
+          },
+          timeout: 60000,
         },
-        timeout: 60000,
-      });
+      );
       break;
     } catch (error) {
       const metaCode = error.response?.data?.error?.code;
@@ -658,9 +793,6 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
   };
 }
 
-/**
- * GEMINI / AI
- */
 function getPresetInstruction(captionPreset, customPrompt) {
   const preset = String(captionPreset || "Luxury Product Caption").trim();
 
@@ -713,12 +845,6 @@ function buildCaptionPrompt({
 You are a senior Instagram marketing copywriter for ${businessName}, a ${location}-based company specializing in premium artificial trees, artificial flowers, custom greenery, and luxury decor installations.
 
 Analyze the image carefully before writing.
-
-Identify what is visible:
-- Product type.
-- Colors.
-- Space style.
-- Strongest marketing angle.
 
 Caption preset:
 ${captionPreset}
@@ -888,7 +1014,11 @@ Return only the edited image.
 `;
 }
 
-async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL, apiKey = GEMINI_API_KEY) {
+async function generateTextWithGemini(
+  prompt,
+  modelName = GEMINI_TEXT_MODEL,
+  apiKey = GEMINI_API_KEY,
+) {
   requireGeminiConfig(apiKey);
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -1178,9 +1308,6 @@ async function insertAiGeneratedMedia({
   return data;
 }
 
-/**
- * SCHEDULE HELPERS
- */
 async function markMediaPublished(mediaAssetId, publishedAt) {
   if (!mediaAssetId || !isValidUuid(mediaAssetId)) return;
 
@@ -1452,9 +1579,6 @@ async function processAiBulkJob(jobId) {
     .eq("id", jobId);
 }
 
-/**
- * META WEBHOOK HELPERS
- */
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
 
@@ -1476,7 +1600,7 @@ function verifyMetaSignature(req) {
   return timingSafeEqual(sigBuffer, expectedBuffer);
 }
 
-async function storeWebhookEvent({ body, field = null, eventType = null }) {
+async function storeWebhookEvent({ body, field = null, eventType = null, processed = false, errorMessage = null }) {
   if (!supabase) return null;
 
   const { data, error } = await supabase
@@ -1487,7 +1611,8 @@ async function storeWebhookEvent({ body, field = null, eventType = null }) {
       event_type: eventType,
       meta_id: null,
       payload: body,
-      processed: false,
+      processed,
+      error_message: errorMessage,
     })
     .select()
     .single();
@@ -1500,7 +1625,7 @@ async function storeWebhookEvent({ body, field = null, eventType = null }) {
   return data;
 }
 
-async function upsertConversationFromMessage({ senderId, text, sentAt, raw }) {
+async function upsertConversationFromMessage({ senderId, text, sentAt }) {
   requireSupabaseConfig();
 
   if (!senderId) return null;
@@ -1538,7 +1663,6 @@ async function upsertConversationFromMessage({ senderId, text, sentAt, raw }) {
       last_message_at: sentAt || new Date().toISOString(),
       unread_count: 1,
       status: "open",
-      raw,
     })
     .select()
     .single();
@@ -1567,15 +1691,34 @@ async function insertInboundMessageFromWebhook(messagingEvent) {
     senderId,
     text: text || messageType,
     sentAt: timestamp,
-    raw: messagingEvent,
   });
 
   if (!conversation) return;
 
-  const { error } = await supabase.from("ig_messages").upsert(
-    {
+  if (mid) {
+    const { error } = await supabase.from("ig_messages").upsert(
+      {
+        conversation_id: conversation.id,
+        meta_message_id: mid,
+        ig_scoped_user_id: senderId,
+        direction: "inbound",
+        message_type: messageType,
+        text,
+        media_url: mediaUrl,
+        from_id: senderId,
+        to_id: recipientId,
+        sent_at: timestamp,
+        raw: messagingEvent,
+      },
+      { onConflict: "meta_message_id" },
+    );
+
+    if (error) {
+      console.warn("Inbound message upsert failed:", error.message);
+    }
+  } else {
+    const { error } = await supabase.from("ig_messages").insert({
       conversation_id: conversation.id,
-      meta_message_id: mid,
       ig_scoped_user_id: senderId,
       direction: "inbound",
       message_type: messageType,
@@ -1585,12 +1728,11 @@ async function insertInboundMessageFromWebhook(messagingEvent) {
       to_id: recipientId,
       sent_at: timestamp,
       raw: messagingEvent,
-    },
-    { onConflict: "meta_message_id" },
-  );
+    });
 
-  if (error) {
-    console.warn("Inbound message insert failed:", error.message);
+    if (error) {
+      console.warn("Inbound message insert failed:", error.message);
+    }
   }
 }
 
@@ -1621,13 +1763,15 @@ function autoReplyRuleMatches(rule, commentText) {
 async function sendCommentPublicReply(igCommentId, message) {
   const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
 
-  const response = await axios.post(metaUrl(`/${igCommentId}/replies`), null, {
-    params: {
+  const response = await graphPostWithFallback(
+    `/${igCommentId}/replies`,
+    null,
+    {
       message,
       access_token: token,
     },
-    timeout: 30000,
-  });
+    { preferMeta: true, timeout: 30000 },
+  );
 
   return response.data;
 }
@@ -1635,13 +1779,15 @@ async function sendCommentPublicReply(igCommentId, message) {
 async function sendCommentPrivateReply(igCommentId, message) {
   const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
 
-  const response = await axios.post(metaUrl(`/${igCommentId}/private_replies`), null, {
-    params: {
+  const response = await graphPostWithFallback(
+    `/${igCommentId}/private_replies`,
+    null,
+    {
       message,
       access_token: token,
     },
-    timeout: 30000,
-  });
+    { preferMeta: true, timeout: 30000 },
+  );
 
   return response.data;
 }
@@ -1689,11 +1835,17 @@ async function applyAutoReplyRulesToComment(commentRow) {
     }
 
     try {
-      if ((rule.reply_mode === "public_reply" || rule.reply_mode === "both") && rule.public_reply_text) {
+      if (
+        (rule.reply_mode === "public_reply" || rule.reply_mode === "both") &&
+        rule.public_reply_text
+      ) {
         await sendCommentPublicReply(commentRow.ig_comment_id, rule.public_reply_text);
       }
 
-      if ((rule.reply_mode === "private_reply" || rule.reply_mode === "both") && rule.private_reply_text) {
+      if (
+        (rule.reply_mode === "private_reply" || rule.reply_mode === "both") &&
+        rule.private_reply_text
+      ) {
         await sendCommentPrivateReply(commentRow.ig_comment_id, rule.private_reply_text);
       }
 
@@ -1749,23 +1901,73 @@ async function applyAutoReplyRulesToComment(commentRow) {
   }
 }
 
+async function fetchCommentDetails(commentId) {
+  const response = await graphGetWithFallback(
+    `/${commentId}`,
+    {
+      fields: "id,text,username,timestamp,like_count,parent_id,media,from",
+      access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+    },
+    { preferMeta: true, timeout: 30000 },
+  );
+
+  return response.data;
+}
+
 async function upsertCommentFromMeta(value) {
   requireSupabaseConfig();
 
-  const igCommentId = value.id || value.comment_id;
+  let commentValue = value || {};
+  let igCommentId = commentValue.id || commentValue.comment_id;
+
   if (!igCommentId) return null;
+
+  let text = commentValue.text || commentValue.message || "";
+
+  if (!text) {
+    try {
+      const details = await fetchCommentDetails(igCommentId);
+      commentValue = { ...details, ...commentValue };
+      text = commentValue.text || commentValue.message || "";
+    } catch (error) {
+      console.warn("Could not fetch comment details:", error.response?.data || error.message);
+    }
+  }
+
+  const mediaObject = commentValue.media || {};
+  const fromObject = commentValue.from || commentValue.user || {};
+
+  const timestampValue = commentValue.timestamp
+    ? new Date(commentValue.timestamp).toISOString()
+    : new Date().toISOString();
 
   const row = {
     ig_comment_id: igCommentId,
-    ig_media_id: value.media_id || value.media?.id || null,
-    parent_comment_id: value.parent_id || value.parent_comment_id || null,
-    username: value.from?.username || value.username || null,
-    user_id: value.from?.id || value.user_id || null,
-    text: value.text || value.message || "",
-    like_count: Number(value.like_count || 0),
-    timestamp: value.timestamp ? new Date(value.timestamp).toISOString() : new Date().toISOString(),
-    is_reply: Boolean(value.parent_id || value.parent_comment_id),
-    raw: value,
+    ig_media_id:
+      commentValue.media_id ||
+      mediaObject.id ||
+      commentValue.ig_media_id ||
+      null,
+    parent_comment_id:
+      commentValue.parent_id ||
+      commentValue.parent_comment_id ||
+      commentValue.parent?.id ||
+      null,
+    username:
+      fromObject.username ||
+      commentValue.username ||
+      commentValue.user?.username ||
+      null,
+    user_id:
+      fromObject.id ||
+      commentValue.user_id ||
+      commentValue.user?.id ||
+      null,
+    text,
+    like_count: Number(commentValue.like_count || 0),
+    timestamp: timestampValue,
+    is_reply: Boolean(commentValue.parent_id || commentValue.parent_comment_id),
+    raw: commentValue,
   };
 
   const { data, error } = await supabase
@@ -1783,6 +1985,346 @@ async function upsertCommentFromMeta(value) {
   return data;
 }
 
+async function saveMediaCache(media) {
+  const { data, error } = await supabase
+    .from("ig_media_cache")
+    .upsert(
+      {
+        ig_media_id: media.id,
+        caption: media.caption || null,
+        media_type: media.media_type || null,
+        media_url: media.media_url || null,
+        permalink: media.permalink || null,
+        thumbnail_url: media.thumbnail_url || null,
+        timestamp: media.timestamp || null,
+        comments_count: media.comments_count || 0,
+        raw: media,
+      },
+      { onConflict: "ig_media_id" },
+    )
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function syncCommentsForMedia(igMediaId) {
+  requireSupabaseConfig();
+
+  const response = await graphGetWithFallback(
+    `/${igMediaId}/comments`,
+    {
+      fields:
+        "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}",
+      access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+    },
+    { preferMeta: true, timeout: 30000 },
+  );
+
+  const saved = [];
+
+  for (const comment of response.data?.data || []) {
+    const savedComment = await upsertCommentFromMeta({
+      ...comment,
+      media_id: igMediaId,
+    });
+
+    if (savedComment) saved.push(savedComment);
+
+    for (const reply of comment.replies?.data || []) {
+      const savedReply = await upsertCommentFromMeta({
+        ...reply,
+        media_id: igMediaId,
+        parent_id: comment.id,
+      });
+
+      if (savedReply) saved.push(savedReply);
+    }
+  }
+
+  return saved;
+}
+
+function extractParticipant(conversation) {
+  const candidates =
+    conversation.participants?.data ||
+    conversation.participants ||
+    conversation.users?.data ||
+    [];
+
+  if (!Array.isArray(candidates)) return null;
+
+  return (
+    candidates.find((p) => {
+      const id = String(p.id || "");
+      return id !== String(IG_USER_ID) && id !== String(FACEBOOK_PAGE_ID);
+    }) || candidates[0] || null
+  );
+}
+
+function normalizeMessageDirection(msg) {
+  const fromId = String(msg.from?.id || msg.from_id || "");
+  if (fromId === String(IG_USER_ID) || fromId === String(FACEBOOK_PAGE_ID)) {
+    return "outbound";
+  }
+
+  return "inbound";
+}
+
+function normalizeMessageAttachment(msg) {
+  const attachments = msg.attachments?.data || msg.attachments || [];
+  if (Array.isArray(attachments) && attachments.length > 0) {
+    return attachments[0];
+  }
+
+  return null;
+}
+
+async function upsertConversationRow(conversation) {
+  requireSupabaseConfig();
+
+  const participant = extractParticipant(conversation);
+  const lastMessage = conversation.messages?.data?.[0] || conversation.messages?.[0] || null;
+
+  const metaConversationId = conversation.id;
+  const igScopedUserId = participant?.id || conversation.ig_scoped_user_id || null;
+  const username =
+    participant?.username ||
+    participant?.name ||
+    conversation.username ||
+    igScopedUserId ||
+    null;
+
+  const { data, error } = await supabase
+    .from("ig_conversations")
+    .upsert(
+      {
+        platform: "instagram",
+        meta_conversation_id: metaConversationId,
+        ig_scoped_user_id: igScopedUserId,
+        username,
+        last_message_text: lastMessage?.message || lastMessage?.text || "",
+        last_message_at:
+          lastMessage?.created_time ||
+          conversation.updated_time ||
+          conversation.last_message_at ||
+          new Date().toISOString(),
+        status: "open",
+      },
+      { onConflict: "meta_conversation_id" },
+    )
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function saveConversationMessages(conversationRow, messages) {
+  requireSupabaseConfig();
+
+  let count = 0;
+
+  for (const msg of messages || []) {
+    const attachment = normalizeMessageAttachment(msg);
+    const messageType = attachment?.type || (msg.message || msg.text ? "text" : "unknown");
+    const mediaUrl = attachment?.payload?.url || attachment?.url || null;
+    const direction = normalizeMessageDirection(msg);
+    const metaMessageId = msg.id || msg.mid || null;
+
+    const payload = {
+      conversation_id: conversationRow.id,
+      meta_message_id: metaMessageId,
+      meta_conversation_id: conversationRow.meta_conversation_id,
+      ig_scoped_user_id: conversationRow.ig_scoped_user_id,
+      direction,
+      message_type: messageType,
+      text: msg.message || msg.text || "",
+      media_url: mediaUrl,
+      from_id: msg.from?.id || null,
+      to_id: msg.to?.data?.[0]?.id || msg.to?.id || null,
+      sent_at: msg.created_time || msg.sent_at || new Date().toISOString(),
+      raw: msg,
+    };
+
+    let error = null;
+
+    if (metaMessageId) {
+      const result = await supabase
+        .from("ig_messages")
+        .upsert(payload, { onConflict: "meta_message_id" });
+      error = result.error;
+    } else {
+      const result = await supabase.from("ig_messages").insert(payload);
+      error = result.error;
+    }
+
+    if (error) {
+      console.warn("Message save failed:", error.message);
+    } else {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+async function fetchMessagesForConversation(conversationId) {
+  try {
+    const response = await graphGetWithFallback(
+      `/${conversationId}/messages`,
+      {
+        fields: "id,message,from,to,created_time,attachments",
+        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+      },
+      { preferMeta: false, timeout: 30000 },
+    );
+
+    return response.data?.data || [];
+  } catch (firstError) {
+    console.warn(
+      "Conversation messages direct fetch failed, trying expanded conversation:",
+      firstError.details || firstError.response?.data || firstError.message,
+    );
+
+    const response = await graphGetWithFallback(
+      `/${conversationId}`,
+      {
+        fields: "messages.limit(50){id,message,from,to,created_time,attachments},participants,updated_time",
+        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+      },
+      { preferMeta: false, timeout: 30000 },
+    );
+
+    return response.data?.messages?.data || [];
+  }
+}
+
+async function syncInstagramConversations() {
+  requireSupabaseConfig();
+
+  if (!hasInstagramTokenConfig()) {
+    throw new Error("IG_USER_ID and META_ACCESS_TOKEN are required for Instagram sync.");
+  }
+
+  const errors = [];
+  let conversationsCount = 0;
+  let messagesCount = 0;
+
+  const response = await graphGetWithFallback(
+    `/${IG_USER_ID}/conversations`,
+    {
+      fields:
+        "id,participants,updated_time,messages.limit(1){id,message,from,to,created_time,attachments}",
+      access_token: META_ACCESS_TOKEN,
+    },
+    { preferMeta: false, timeout: 30000 },
+  );
+
+  const conversations = response.data?.data || [];
+
+  for (const conversation of conversations) {
+    try {
+      const conversationRow = await upsertConversationRow(conversation);
+      conversationsCount += 1;
+
+      try {
+        const messages = await fetchMessagesForConversation(conversation.id);
+        messagesCount += await saveConversationMessages(conversationRow, messages);
+      } catch (messageError) {
+        errors.push({
+          conversationId: conversation.id,
+          stage: "messages",
+          error: messageError.details || messageError.response?.data || messageError.message,
+        });
+      }
+    } catch (conversationError) {
+      errors.push({
+        conversationId: conversation.id,
+        stage: "conversation",
+        error:
+          conversationError.details ||
+          conversationError.response?.data ||
+          conversationError.message,
+      });
+    }
+  }
+
+  return {
+    conversationsCount,
+    messagesCount,
+    errors,
+  };
+}
+
+async function syncPageConversations() {
+  requireSupabaseConfig();
+
+  if (!hasPageTokenConfig()) {
+    throw new Error("FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN are required.");
+  }
+
+  const errors = [];
+  let conversationsCount = 0;
+  let messagesCount = 0;
+
+  const response = await axios.get(metaGraphUrl(`/${FACEBOOK_PAGE_ID}/conversations`), {
+    params: {
+      platform: "instagram",
+      fields:
+        "id,updated_time,participants,messages.limit(1){id,message,from,to,created_time,attachments}",
+      access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+    },
+    timeout: 30000,
+  });
+
+  const conversations = response.data?.data || [];
+
+  for (const conversation of conversations) {
+    try {
+      const conversationRow = await upsertConversationRow(conversation);
+      conversationsCount += 1;
+
+      try {
+        const messagesResponse = await axios.get(
+          metaGraphUrl(`/${conversation.id}/messages`),
+          {
+            params: {
+              fields: "id,message,from,to,created_time,attachments",
+              access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+            },
+            timeout: 30000,
+          },
+        );
+
+        messagesCount += await saveConversationMessages(
+          conversationRow,
+          messagesResponse.data?.data || [],
+        );
+      } catch (messageError) {
+        errors.push({
+          conversationId: conversation.id,
+          stage: "messages",
+          error: messageError.response?.data || messageError.message,
+        });
+      }
+    } catch (conversationError) {
+      errors.push({
+        conversationId: conversation.id,
+        stage: "conversation",
+        error: conversationError.response?.data || conversationError.message,
+      });
+    }
+  }
+
+  return {
+    conversationsCount,
+    messagesCount,
+    errors,
+  };
+}
+
 /**
  * ROOT / HEALTH
  */
@@ -1792,11 +2334,18 @@ app.get("/", (_req, res) => {
     app: "AutoFlow Backend",
     status: "running",
     graphVersion: GRAPH_VERSION,
-    cloudinaryConfigured: Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET),
+    instagramTokenConfigured: hasInstagramTokenConfig(),
+    igUserIdConfigured: Boolean(IG_USER_ID),
+    pageTokenConfigured: hasPageTokenConfig(),
     supabaseConfigured: Boolean(supabase),
+    cloudinaryConfigured: Boolean(
+      CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET,
+    ),
     aiStudio: true,
-    inboxEnabled: Boolean(FACEBOOK_PAGE_ID && FACEBOOK_PAGE_ACCESS_TOKEN),
-    commentsEnabled: Boolean(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN),
+    instagramLoginMode: hasInstagramTokenConfig(),
+    inboxEnabled: hasInstagramTokenConfig() || hasPageTokenConfig(),
+    pageMessagingEnabled: hasPageTokenConfig(),
+    commentsEnabled: Boolean((META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN) && IG_USER_ID),
     webhooksEnabled: Boolean(META_WEBHOOK_VERIFY_TOKEN),
   });
 });
@@ -1806,11 +2355,18 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     timestamp: new Date().toISOString(),
     graphVersion: GRAPH_VERSION,
-    cloudinaryConfigured: Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET),
+    instagramTokenConfigured: hasInstagramTokenConfig(),
+    igUserIdConfigured: Boolean(IG_USER_ID),
+    pageTokenConfigured: hasPageTokenConfig(),
     supabaseConfigured: Boolean(supabase),
+    cloudinaryConfigured: Boolean(
+      CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET,
+    ),
     aiStudio: true,
-    inboxEnabled: Boolean(FACEBOOK_PAGE_ID && FACEBOOK_PAGE_ACCESS_TOKEN),
-    commentsEnabled: Boolean(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN),
+    instagramLoginMode: hasInstagramTokenConfig(),
+    inboxEnabled: hasInstagramTokenConfig() || hasPageTokenConfig(),
+    pageMessagingEnabled: hasPageTokenConfig(),
+    commentsEnabled: Boolean((META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN) && IG_USER_ID),
     webhooksEnabled: Boolean(META_WEBHOOK_VERIFY_TOKEN),
   });
 });
@@ -1840,7 +2396,12 @@ app.post("/api/webhooks/meta", async (req, res) => {
     }
 
     const body = req.body;
-    const event = await storeWebhookEvent({ body, field: null, eventType: "webhook" });
+    const event = await storeWebhookEvent({
+      body,
+      field: null,
+      eventType: "webhook",
+      processed: false,
+    });
 
     for (const entry of body.entry || []) {
       for (const messagingEvent of entry.messaging || []) {
@@ -1848,15 +2409,30 @@ app.post("/api/webhooks/meta", async (req, res) => {
       }
 
       for (const change of entry.changes || []) {
-        if (change.field && String(change.field).includes("comment")) {
+        console.log("Webhook change:", {
+          field: change.field,
+          value: change.value,
+        });
+
+        await storeWebhookEvent({
+          body: change,
+          field: change.field,
+          eventType: "change",
+          processed: false,
+        });
+
+        const field = String(change.field || "").toLowerCase();
+
+        if (field.includes("comment") || field.includes("comments")) {
           await upsertCommentFromMeta(change.value || {});
         }
 
-        if (change.field && String(change.field).includes("message")) {
+        if (field.includes("message") || field.includes("messages")) {
           await storeWebhookEvent({
             body: change,
             field: change.field,
             eventType: "message_change",
+            processed: true,
           });
         }
       }
@@ -1872,10 +2448,108 @@ app.post("/api/webhooks/meta", async (req, res) => {
     return res.json({ ok: true });
   } catch (error) {
     console.error("Webhook processing failed:", error.response?.data || error.message);
+
+    await storeWebhookEvent({
+      body: req.body,
+      field: null,
+      eventType: "webhook_error",
+      processed: false,
+      errorMessage: error.response?.data
+        ? JSON.stringify(error.response.data)
+        : error.message,
+    });
+
     return res.status(500).json({
       ok: false,
       error: error.response?.data || error.message,
     });
+  }
+});
+
+/**
+ * DEBUG
+ */
+app.get("/api/debug/webhook-events", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("meta_webhook_events")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      events: data || [],
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/debug/comments", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { count, error: countError } = await supabase
+      .from("ig_comments")
+      .select("*", { count: "exact", head: true });
+
+    if (countError) throw countError;
+
+    const { data, error } = await supabase
+      .from("ig_comments")
+      .select("*")
+      .order("timestamp", { ascending: false })
+      .limit(20);
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      count,
+      comments: data || [],
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/debug/inbox", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { count: conversationsCount, error: convCountError } = await supabase
+      .from("ig_conversations")
+      .select("*", { count: "exact", head: true });
+
+    if (convCountError) throw convCountError;
+
+    const { count: messagesCount, error: msgCountError } = await supabase
+      .from("ig_messages")
+      .select("*", { count: "exact", head: true });
+
+    if (msgCountError) throw msgCountError;
+
+    const { data, error } = await supabase
+      .from("ig_conversations")
+      .select("*")
+      .order("last_message_at", { ascending: false, nullsFirst: false })
+      .limit(10);
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      conversationsCount,
+      messagesCount,
+      conversations: data || [],
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -1885,19 +2559,19 @@ app.post("/api/webhooks/meta", async (req, res) => {
 async function testMetaConnection() {
   requireMetaPublishConfig();
 
-  const response = await axios.get(igUrl("/me"), {
-    params: {
+  const response = await graphGetWithFallback(
+    "/me",
+    {
       fields: "user_id,username",
       access_token: META_ACCESS_TOKEN,
     },
-    timeout: 30000,
-  });
+    { preferMeta: false },
+  );
 
   return {
     account: response.data,
     configuredIgUserId: IG_USER_ID,
     idMatches: String(response.data.user_id) === String(IG_USER_ID),
-    graphHost: IG_GRAPH_HOST,
     graphVersion: GRAPH_VERSION,
   };
 }
@@ -1909,7 +2583,7 @@ app.get("/api/meta/test-connection", async (_req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message,
+      error: error.details || error.response?.data || error.message,
     });
   }
 });
@@ -1921,7 +2595,7 @@ app.post("/api/meta/test-connection", async (_req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message,
+      error: error.details || error.response?.data || error.message,
     });
   }
 });
@@ -1953,7 +2627,8 @@ app.post("/api/upload", upload.any(), async (req, res) => {
       });
     }
 
-    const uploaded = mediaType === "image" ? await uploadNormalizedImage(file) : await uploadVideo(file);
+    const uploaded =
+      mediaType === "image" ? await uploadNormalizedImage(file) : await uploadVideo(file);
 
     const { data: media, error } = await supabase
       .from("media_assets")
@@ -2026,10 +2701,7 @@ app.delete("/api/media/:id", async (req, res) => {
   try {
     requireSupabaseConfig();
 
-    const { error } = await supabase
-      .from("media_assets")
-      .delete()
-      .eq("id", req.params.id);
+    const { error } = await supabase.from("media_assets").delete().eq("id", req.params.id);
 
     if (error) throw error;
 
@@ -2065,7 +2737,7 @@ app.post("/api/meta/publish-now", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message,
+      error: error.details || error.response?.data || error.message,
     });
   }
 });
@@ -2201,9 +2873,7 @@ app.post("/api/ai/edit-image", async (req, res) => {
     const resolution = Number(req.body.resolution || 1080);
     const quality = req.body.quality || "high";
     const backgroundIntensity =
-      req.body.backgroundIntensity ||
-      req.body.background_intensity ||
-      "medium";
+      req.body.backgroundIntensity || req.body.background_intensity || "medium";
     const saveToLibrary = req.body.saveToLibrary !== false;
     const userPrompt = req.body.prompt || req.body.ai_edit_prompt || "";
 
@@ -2412,9 +3082,7 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
         resolution,
         quality,
         backgroundIntensity:
-          item.backgroundIntensity ||
-          commonOptions.backgroundIntensity ||
-          "medium",
+          item.backgroundIntensity || commonOptions.backgroundIntensity || "medium",
         userPrompt: rawPrompt,
       });
 
@@ -2609,59 +3277,72 @@ app.get("/api/inbox/conversations", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, conversations: data || [] });
+    res.json({ ok: true, conversations: (data || []).map(withAliases) });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-app.post("/api/inbox/sync-conversations", async (_req, res) => {
+app.post("/api/inbox/sync-instagram", async (_req, res) => {
   try {
-    requireSupabaseConfig();
-    requirePageMessagingConfig();
+    const result = await syncInstagramConversations();
 
-    const response = await axios.get(metaUrl(`/${FACEBOOK_PAGE_ID}/conversations`), {
-      params: {
-        platform: "instagram",
-        fields: "id,updated_time,participants,messages.limit(1){id,message,from,to,created_time}",
-        access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
-      },
-      timeout: 30000,
+    res.json({
+      ok: true,
+      ...result,
     });
-
-    const synced = [];
-
-    for (const conv of response.data?.data || []) {
-      const participant = conv.participants?.data?.find(
-        (p) => String(p.id) !== String(FACEBOOK_PAGE_ID),
-      );
-
-      const lastMessage = conv.messages?.data?.[0];
-
-      const { data, error } = await supabase
-        .from("ig_conversations")
-        .upsert(
-          {
-            platform: "instagram",
-            meta_conversation_id: conv.id,
-            ig_scoped_user_id: participant?.id || null,
-            username: participant?.name || participant?.username || participant?.id || null,
-            last_message_text: lastMessage?.message || "",
-            last_message_at: lastMessage?.created_time || conv.updated_time || new Date().toISOString(),
-            raw: conv,
-          },
-          { onConflict: "meta_conversation_id" },
-        )
-        .select()
-        .single();
-
-      if (!error) synced.push(data);
-    }
-
-    res.json({ ok: true, conversations: synced });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      requiresPageToken: true,
+      error: error.details || error.response?.data || error.message,
+    });
   }
+});
+
+app.post("/api/inbox/sync-conversations", async (_req, res) => {
+  const errors = [];
+
+  try {
+    const instagramResult = await syncInstagramConversations();
+
+    return res.json({
+      ok: true,
+      mode: "instagram",
+      ...instagramResult,
+    });
+  } catch (instagramError) {
+    errors.push({
+      mode: "instagram",
+      error:
+        instagramError.details ||
+        instagramError.response?.data ||
+        instagramError.message,
+    });
+  }
+
+  if (hasPageTokenConfig()) {
+    try {
+      const pageResult = await syncPageConversations();
+
+      return res.json({
+        ok: true,
+        mode: "page",
+        ...pageResult,
+        previousErrors: errors,
+      });
+    } catch (pageError) {
+      errors.push({
+        mode: "page",
+        error: pageError.response?.data || pageError.message,
+      });
+    }
+  }
+
+  return res.status(500).json({
+    ok: false,
+    errors,
+  });
 });
 
 app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
@@ -2676,37 +3357,14 @@ app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
 
     if (convError) throw convError;
 
-    if (req.query.sync === "true" && conversation.meta_conversation_id && FACEBOOK_PAGE_ACCESS_TOKEN) {
-      const response = await axios.get(metaUrl(`/${conversation.meta_conversation_id}/messages`), {
-        params: {
-          fields: "id,message,from,to,created_time,attachments",
-          access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
-        },
-        timeout: 30000,
-      });
-
-      for (const msg of response.data?.data || []) {
-        const fromId = msg.from?.id || null;
-        const direction =
-          String(fromId) === String(FACEBOOK_PAGE_ID) ? "outbound" : "inbound";
-        const attachment = msg.attachments?.data?.[0] || null;
-
-        await supabase.from("ig_messages").upsert(
-          {
-            conversation_id: conversation.id,
-            meta_message_id: msg.id,
-            meta_conversation_id: conversation.meta_conversation_id,
-            ig_scoped_user_id: conversation.ig_scoped_user_id,
-            direction,
-            message_type: attachment ? attachment.type || "unknown" : "text",
-            text: msg.message || "",
-            media_url: attachment?.payload?.url || null,
-            from_id: fromId,
-            to_id: msg.to?.data?.[0]?.id || null,
-            sent_at: msg.created_time || new Date().toISOString(),
-            raw: msg,
-          },
-          { onConflict: "meta_message_id" },
+    if (req.query.sync === "true" && conversation.meta_conversation_id) {
+      try {
+        const messages = await fetchMessagesForConversation(conversation.meta_conversation_id);
+        await saveConversationMessages(conversation, messages);
+      } catch (syncError) {
+        console.warn(
+          "Message sync on open failed:",
+          syncError.details || syncError.response?.data || syncError.message,
         );
       }
     }
@@ -2719,16 +3377,22 @@ app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, conversation, messages: data || [] });
+    res.json({
+      ok: true,
+      conversation: withAliases(conversation),
+      messages: (data || []).map(withAliases),
+    });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
 app.post("/api/inbox/send-text", async (req, res) => {
   try {
     requireSupabaseConfig();
-    requirePageMessagingConfig();
 
     const { conversationId, recipientId, text } = req.body;
 
@@ -2739,18 +3403,44 @@ app.post("/api/inbox/send-text", async (req, res) => {
       });
     }
 
-    const response = await axios.post(
-      metaUrl(`/${FACEBOOK_PAGE_ID}/messages`),
-      {
-        recipient: { id: recipientId },
-        messaging_type: "RESPONSE",
-        message: { text },
-      },
-      {
-        params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
-        timeout: 30000,
-      },
-    );
+    let response = null;
+    let mode = null;
+
+    if (hasPageTokenConfig()) {
+      response = await axios.post(
+        metaGraphUrl(`/${FACEBOOK_PAGE_ID}/messages`),
+        {
+          recipient: { id: recipientId },
+          messaging_type: "RESPONSE",
+          message: { text },
+        },
+        {
+          params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
+          timeout: 30000,
+        },
+      );
+
+      mode = "page";
+    } else if (hasInstagramTokenConfig()) {
+      response = await graphPostWithFallback(
+        `/${IG_USER_ID}/messages`,
+        {
+          recipient: { id: recipientId },
+          message: { text },
+        },
+        {
+          access_token: META_ACCESS_TOKEN,
+        },
+        { preferMeta: false, timeout: 30000 },
+      );
+
+      mode = "instagram";
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "No messaging token configured.",
+      });
+    }
 
     if (conversationId && isValidUuid(conversationId)) {
       await supabase.from("ig_messages").insert({
@@ -2760,7 +3450,7 @@ app.post("/api/inbox/send-text", async (req, res) => {
         direction: "outbound",
         message_type: "text",
         text,
-        from_id: FACEBOOK_PAGE_ID,
+        from_id: mode === "page" ? FACEBOOK_PAGE_ID : IG_USER_ID,
         to_id: recipientId,
         sent_at: new Date().toISOString(),
         raw: response.data,
@@ -2776,16 +3466,18 @@ app.post("/api/inbox/send-text", async (req, res) => {
         .eq("id", conversationId);
     }
 
-    res.json({ ok: true, result: response.data });
+    res.json({ ok: true, mode, result: response.data });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
 app.post("/api/inbox/send-image", async (req, res) => {
   try {
     requireSupabaseConfig();
-    requirePageMessagingConfig();
 
     const { conversationId, recipientId, imageUrl } = req.body;
 
@@ -2796,26 +3488,53 @@ app.post("/api/inbox/send-image", async (req, res) => {
       });
     }
 
-    const response = await axios.post(
-      metaUrl(`/${FACEBOOK_PAGE_ID}/messages`),
-      {
-        recipient: { id: recipientId },
-        messaging_type: "RESPONSE",
-        message: {
-          attachment: {
-            type: "image",
-            payload: {
-              url: imageUrl,
-              is_reusable: true,
-            },
+    let response = null;
+    let mode = null;
+
+    const messagePayload = {
+      recipient: { id: recipientId },
+      message: {
+        attachment: {
+          type: "image",
+          payload: {
+            url: imageUrl,
+            is_reusable: true,
           },
         },
       },
-      {
-        params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
-        timeout: 30000,
-      },
-    );
+    };
+
+    if (hasPageTokenConfig()) {
+      response = await axios.post(
+        metaGraphUrl(`/${FACEBOOK_PAGE_ID}/messages`),
+        {
+          ...messagePayload,
+          messaging_type: "RESPONSE",
+        },
+        {
+          params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
+          timeout: 30000,
+        },
+      );
+
+      mode = "page";
+    } else if (hasInstagramTokenConfig()) {
+      response = await graphPostWithFallback(
+        `/${IG_USER_ID}/messages`,
+        messagePayload,
+        {
+          access_token: META_ACCESS_TOKEN,
+        },
+        { preferMeta: false, timeout: 30000 },
+      );
+
+      mode = "instagram";
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "No messaging token configured.",
+      });
+    }
 
     if (conversationId && isValidUuid(conversationId)) {
       await supabase.from("ig_messages").insert({
@@ -2825,7 +3544,7 @@ app.post("/api/inbox/send-image", async (req, res) => {
         direction: "outbound",
         message_type: "image",
         media_url: imageUrl,
-        from_id: FACEBOOK_PAGE_ID,
+        from_id: mode === "page" ? FACEBOOK_PAGE_ID : IG_USER_ID,
         to_id: recipientId,
         sent_at: new Date().toISOString(),
         raw: response.data,
@@ -2841,9 +3560,12 @@ app.post("/api/inbox/send-image", async (req, res) => {
         .eq("id", conversationId);
     }
 
-    res.json({ ok: true, result: response.data });
+    res.json({ ok: true, mode, result: response.data });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
@@ -2854,51 +3576,105 @@ app.post("/api/comments/sync-media", async (_req, res) => {
   try {
     requireSupabaseConfig();
 
-    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-
-    if (!IG_USER_ID || !token) {
+    if (!IG_USER_ID || !(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN)) {
       return res.status(400).json({
         ok: false,
         error: "IG_USER_ID and access token are required.",
       });
     }
 
-    const response = await axios.get(metaUrl(`/${IG_USER_ID}/media`), {
-      params: {
-        fields: "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
-        access_token: token,
+    const response = await graphGetWithFallback(
+      `/${IG_USER_ID}/media`,
+      {
+        fields:
+          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
+        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
       },
-      timeout: 30000,
-    });
+      { preferMeta: true, timeout: 30000 },
+    );
 
     const saved = [];
 
     for (const media of response.data?.data || []) {
-      const { data, error } = await supabase
-        .from("ig_media_cache")
-        .upsert(
-          {
-            ig_media_id: media.id,
-            caption: media.caption || null,
-            media_type: media.media_type || null,
-            media_url: media.media_url || null,
-            permalink: media.permalink || null,
-            thumbnail_url: media.thumbnail_url || null,
-            timestamp: media.timestamp || null,
-            comments_count: media.comments_count || 0,
-            raw: media,
-          },
-          { onConflict: "ig_media_id" },
-        )
-        .select()
-        .single();
-
-      if (!error) saved.push(data);
+      try {
+        const row = await saveMediaCache(media);
+        saved.push(row);
+      } catch (error) {
+        console.warn("Media cache save failed:", error.message);
+      }
     }
 
     res.json({ ok: true, media: saved });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.post("/api/comments/sync-all", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    if (!IG_USER_ID || !(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN)) {
+      return res.status(400).json({
+        ok: false,
+        error: "IG_USER_ID and access token are required.",
+      });
+    }
+
+    const errors = [];
+    let mediaCount = 0;
+    let commentsCount = 0;
+
+    const mediaResponse = await graphGetWithFallback(
+      `/${IG_USER_ID}/media`,
+      {
+        fields:
+          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
+        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+      },
+      { preferMeta: true, timeout: 30000 },
+    );
+
+    const mediaItems = mediaResponse.data?.data || [];
+
+    for (const media of mediaItems) {
+      try {
+        await saveMediaCache(media);
+        mediaCount += 1;
+      } catch (error) {
+        errors.push({
+          stage: "media_cache",
+          mediaId: media.id,
+          error: error.response?.data || error.message,
+        });
+      }
+
+      try {
+        const savedComments = await syncCommentsForMedia(media.id);
+        commentsCount += savedComments.length;
+      } catch (error) {
+        errors.push({
+          stage: "comments",
+          mediaId: media.id,
+          error: error.details || error.response?.data || error.message,
+        });
+      }
+    }
+
+    res.json({
+      ok: true,
+      mediaCount,
+      commentsCount,
+      errors,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
@@ -2929,39 +3705,14 @@ app.post("/api/comments/sync", async (req, res) => {
       return res.status(400).json({ ok: false, error: "igMediaId is required." });
     }
 
-    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-
-    const response = await axios.get(metaUrl(`/${igMediaId}/comments`), {
-      params: {
-        fields: "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}",
-        access_token: token,
-      },
-      timeout: 30000,
-    });
-
-    const saved = [];
-
-    for (const comment of response.data?.data || []) {
-      const savedComment = await upsertCommentFromMeta({
-        ...comment,
-        media_id: igMediaId,
-      });
-
-      if (savedComment) saved.push(savedComment);
-
-      for (const reply of comment.replies?.data || []) {
-        const savedReply = await upsertCommentFromMeta({
-          ...reply,
-          media_id: igMediaId,
-          parent_id: comment.id,
-        });
-        if (savedReply) saved.push(savedReply);
-      }
-    }
+    const saved = await syncCommentsForMedia(igMediaId);
 
     res.json({ ok: true, comments: saved });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
@@ -3023,7 +3774,10 @@ app.post("/api/comments/:commentId/reply", async (req, res) => {
 
     res.json({ ok: true, result });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
@@ -3049,7 +3803,10 @@ app.post("/api/comments/:commentId/private-reply", async (req, res) => {
 
     res.json({ ok: true, result });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
@@ -3057,10 +3814,14 @@ app.post("/api/comments/:commentId/like", async (req, res) => {
   try {
     const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
 
-    const response = await axios.post(metaUrl(`/${req.params.commentId}/likes`), null, {
-      params: { access_token: token },
-      timeout: 30000,
-    });
+    const response = await graphPostWithFallback(
+      `/${req.params.commentId}/likes`,
+      null,
+      {
+        access_token: token,
+      },
+      { preferMeta: true, timeout: 30000 },
+    );
 
     res.json({ ok: true, result: response.data });
   } catch (error) {
@@ -3068,6 +3829,7 @@ app.post("/api/comments/:commentId/like", async (req, res) => {
       ok: false,
       unsupported: true,
       error:
+        error.details ||
         error.response?.data ||
         "Instagram comment like is not supported by this API/token.",
     });
@@ -3079,13 +3841,15 @@ app.post("/api/comments/:commentId/hide", async (req, res) => {
     const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
     const hide = req.body.hide !== false;
 
-    const response = await axios.post(metaUrl(`/${req.params.commentId}`), null, {
-      params: {
+    const response = await graphPostWithFallback(
+      `/${req.params.commentId}`,
+      null,
+      {
         hide,
         access_token: token,
       },
-      timeout: 30000,
-    });
+      { preferMeta: true, timeout: 30000 },
+    );
 
     await supabase
       ?.from("ig_comments")
@@ -3094,7 +3858,10 @@ app.post("/api/comments/:commentId/hide", async (req, res) => {
 
     res.json({ ok: true, result: response.data });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
   }
 });
 
@@ -3102,7 +3869,7 @@ app.delete("/api/comments/:commentId", async (req, res) => {
   try {
     const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
 
-    const response = await axios.delete(metaUrl(`/${req.params.commentId}`), {
+    const response = await axios.delete(metaGraphUrl(`/${req.params.commentId}`), {
       params: { access_token: token },
       timeout: 30000,
     });
@@ -3114,7 +3881,10 @@ app.delete("/api/comments/:commentId", async (req, res) => {
 
     res.json({ ok: true, result: response.data });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message,
+    });
   }
 });
 
@@ -3154,8 +3924,7 @@ app.post("/api/comments/auto-reply/rules", async (req, res) => {
         reply_mode: body.replyMode || body.reply_mode || "private_reply",
         public_reply_text: body.publicReplyText || body.public_reply_text || null,
         private_reply_text: body.privateReplyText || body.private_reply_text || null,
-        only_once_per_user:
-          body.onlyOncePerUser ?? body.only_once_per_user ?? true,
+        only_once_per_user: body.onlyOncePerUser ?? body.only_once_per_user ?? true,
       })
       .select()
       .single();
@@ -3401,7 +4170,10 @@ cron.schedule("*/5 * * * *", async () => {
       try {
         await publishScheduledPost(post);
       } catch (error) {
-        console.error(`Failed scheduled post ${post.id}:`, error.response?.data || error.message);
+        console.error(
+          `Failed scheduled post ${post.id}:`,
+          error.response?.data || error.message,
+        );
       }
     }
   } catch (error) {
