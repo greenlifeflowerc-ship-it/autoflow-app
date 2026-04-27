@@ -11,6 +11,7 @@ import { v2 as cloudinary } from "cloudinary";
 import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -27,7 +28,11 @@ const GRAPH_VERSION = process.env.GRAPH_VERSION || "v25.0";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const IG_USER_ID = process.env.IG_USER_ID;
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const AI_DEFAULT_PROVIDER = process.env.AI_DEFAULT_PROVIDER || "gemini";
 
 const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_IMAGE_MODEL =
@@ -37,12 +42,20 @@ const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
 cloudinary.config({
   cloud_name: CLOUDINARY_CLOUD_NAME,
   api_key: CLOUDINARY_API_KEY,
   api_secret: CLOUDINARY_API_SECRET,
   secure: true
 });
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,11 +72,6 @@ const upload = multer({
     fileSize: 250 * 1024 * 1024
   }
 });
-
-// Temporary memory storage only.
-// On Render restart/redeploy, scheduled posts are lost.
-// Later replace with Supabase/PostgreSQL.
-const posts = [];
 
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
@@ -94,12 +102,11 @@ function requireCloudinaryConfig() {
   }
 }
 
-function isPublicHttpsUrl(url) {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "https:";
-  } catch {
-    return false;
+function requireSupabaseConfig() {
+  if (!supabase) {
+    throw new Error(
+      "Missing Supabase environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY."
+    );
   }
 }
 
@@ -109,7 +116,16 @@ function cleanupFile(filePath) {
       fs.unlinkSync(filePath);
     }
   } catch {
-    // Ignore cleanup errors.
+    // ignore
+  }
+}
+
+function isPublicHttpsUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:";
+  } catch {
+    return false;
   }
 }
 
@@ -147,21 +163,21 @@ function parseJsonLoose(text) {
 }
 
 function detectMediaTypeFromUrl(url) {
-  const lower = String(url || "").split("?")[0].toLowerCase();
+  const clean = String(url || "").split("?")[0].toLowerCase();
 
   if (
-    lower.endsWith(".jpg") ||
-    lower.endsWith(".jpeg") ||
-    lower.endsWith(".png") ||
-    lower.endsWith(".webp")
+    clean.endsWith(".jpg") ||
+    clean.endsWith(".jpeg") ||
+    clean.endsWith(".png") ||
+    clean.endsWith(".webp")
   ) {
     return "image";
   }
 
   if (
-    lower.endsWith(".mp4") ||
-    lower.endsWith(".mov") ||
-    lower.endsWith(".m4v")
+    clean.endsWith(".mp4") ||
+    clean.endsWith(".mov") ||
+    clean.endsWith(".m4v")
   ) {
     return "video";
   }
@@ -200,6 +216,9 @@ function detectMediaTypeFromFile(file) {
 function normalizeMediaInput(body) {
   const rawMediaType = body.mediaType || body.media_type || null;
 
+  const mediaAssetId =
+    body.mediaAssetId || body.media_asset_id || body.mediaId || body.media_id || null;
+
   const imageUrl = body.imageUrl || body.image_url || null;
   const videoUrl = body.videoUrl || body.video_url || null;
 
@@ -216,10 +235,95 @@ function normalizeMediaInput(body) {
   if (mediaType === "reel") mediaType = "video";
 
   return {
+    mediaAssetId,
     mediaUrl,
     imageUrl,
     videoUrl,
     mediaType
+  };
+}
+
+function normalizeProvider(value) {
+  const provider = String(value || AI_DEFAULT_PROVIDER || "gemini")
+    .trim()
+    .toLowerCase();
+
+  if (["gemini", "openai", "openrouter"].includes(provider)) {
+    return provider;
+  }
+
+  return "gemini";
+}
+
+function getProviderApiKey({ provider, apiKey }) {
+  const cleanKey = apiKey ? String(apiKey).trim() : "";
+
+  if (cleanKey.length > 0) return cleanKey;
+
+  if (provider === "gemini") return GEMINI_API_KEY;
+  if (provider === "openai") return OPENAI_API_KEY;
+  if (provider === "openrouter") return OPENROUTER_API_KEY;
+
+  return null;
+}
+
+function classifyModel(provider, modelId, raw = {}) {
+  const id = String(modelId || "").replace("models/", "");
+  const lower = id.toLowerCase();
+  const methods = raw.supportedGenerationMethods || [];
+
+  const isEmbedding =
+    lower.includes("embedding") ||
+    lower.includes("embed") ||
+    lower.includes("aqa");
+
+  const supportsText =
+    provider === "gemini"
+      ? methods.includes("generateContent") && !isEmbedding
+      : !isEmbedding;
+
+  const supportsImage =
+    lower.includes("image") ||
+    lower.includes("imagen") ||
+    lower.includes("vision") ||
+    lower.includes("gpt-4o") ||
+    lower.includes("nano");
+
+  const supportsVideo =
+    lower.includes("video") ||
+    lower.includes("veo");
+
+  let type = "text";
+  if (supportsVideo) type = "video";
+  else if (supportsImage) type = "image";
+
+  let isFree = false;
+
+  if (provider === "gemini") {
+    isFree = true;
+  }
+
+  if (provider === "openrouter") {
+    const pricing = raw.pricing || {};
+    const promptPrice = Number(pricing.prompt || 0);
+    const completionPrice = Number(pricing.completion || 0);
+
+    isFree =
+      lower.includes(":free") ||
+      (promptPrice === 0 && completionPrice === 0);
+  }
+
+  return {
+    id,
+    name: raw.name || id,
+    displayName: raw.displayName || raw.name || id,
+    description: raw.description || "",
+    type,
+    supportsText,
+    supportsImage,
+    supportsVideo,
+    isFree,
+    supportedGenerationMethods: methods
   };
 }
 
@@ -325,12 +429,6 @@ async function uploadVideo(file) {
   };
 }
 
-/**
- * Wait until Meta media container is ready.
- * This is required for BOTH images and videos.
- * Without this, Meta may return code 9007:
- * "Media ID is not available"
- */
 async function pollMediaContainerStatus(containerId) {
   console.log(`Waiting for Meta container to be ready: ${containerId}`);
 
@@ -374,9 +472,7 @@ async function pollMediaContainerStatus(containerId) {
         error.response?.data || error.message
       );
 
-      if (attempt === 24) {
-        throw error;
-      }
+      if (attempt === 24) throw error;
 
       await sleep(5000);
     }
@@ -385,11 +481,6 @@ async function pollMediaContainerStatus(containerId) {
   throw new Error("Meta media container did not finish processing in time.");
 }
 
-/**
- * Instagram publish:
- * image => image_url + media_type IMAGE
- * video => video_url + media_type VIDEO
- */
 async function publishToInstagram({
   mediaUrl,
   imageUrl,
@@ -445,7 +536,6 @@ async function publishToInstagram({
 
   console.log(`Meta media container created: ${creationId}`);
 
-  // IMPORTANT: Poll for images and videos.
   await pollMediaContainerStatus(creationId);
 
   const publishUrl = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}/media_publish`;
@@ -474,7 +564,7 @@ async function publishToInstagram({
       );
 
       if (metaCode === 9007 && attempt < 3) {
-        console.warn("Meta media not ready yet. Retrying publish in 10 seconds...");
+        console.warn("Meta media not ready. Retrying publish in 10 seconds...");
         await sleep(10000);
         await pollMediaContainerStatus(creationId);
         continue;
@@ -506,7 +596,7 @@ async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL) {
   return result.response.text();
 }
 
-async function generateTextWithGeminiVision({
+async function generateCaptionWithGeminiVision({
   imageUrl,
   prompt,
   modelName = GEMINI_TEXT_MODEL
@@ -527,12 +617,87 @@ async function generateTextWithGeminiVision({
   }
 }
 
-async function generateCaptionWithGemini({
+async function generateCaptionWithOpenAI({
+  provider,
+  apiKey,
+  model,
+  imageUrl,
+  language,
+  tone
+}) {
+  const prompt = `
+You are a social media marketing assistant for artificial trees, artificial flowers, luxury interior decor, and premium visual marketing.
+
+Generate Instagram content.
+
+Language: ${language}
+Tone: ${tone}
+
+Return strict JSON only:
+{
+  "caption": "short marketing caption",
+  "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5", "#tag6", "#tag7", "#tag8"],
+  "alt_text": "short alt text"
+}
+`;
+
+  const endpoint =
+    provider === "openrouter"
+      ? "https://openrouter.ai/api/v1/chat/completions"
+      : "https://api.openai.com/v1/chat/completions";
+
+  const response = await axios.post(
+    endpoint,
+    {
+      model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: prompt
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: imageUrl
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 90000
+    }
+  );
+
+  return response.data?.choices?.[0]?.message?.content || "";
+}
+
+async function generateCaptionWithAI({
+  provider = "gemini",
+  apiKey,
   imageUrl,
   language = "arabic",
   tone = "premium",
-  model = GEMINI_TEXT_MODEL
+  model
 }) {
+  const selectedProvider = normalizeProvider(provider);
+  const selectedApiKey = getProviderApiKey({
+    provider: selectedProvider,
+    apiKey
+  });
+
+  if (!selectedApiKey && selectedProvider !== "gemini") {
+    throw new Error(`Missing API key for provider: ${selectedProvider}`);
+  }
+
   const prompt = `
 You are a social media marketing assistant for artificial trees, artificial flowers, luxury interior decor, and premium visual marketing.
 
@@ -552,11 +717,24 @@ Return strict JSON only:
 }
 `;
 
-  const text = await generateTextWithGeminiVision({
-    imageUrl,
-    prompt,
-    modelName: model
-  });
+  let text = "";
+
+  if (selectedProvider === "gemini") {
+    text = await generateCaptionWithGeminiVision({
+      imageUrl,
+      prompt,
+      modelName: model || GEMINI_TEXT_MODEL
+    });
+  } else {
+    text = await generateCaptionWithOpenAI({
+      provider: selectedProvider,
+      apiKey: selectedApiKey,
+      model,
+      imageUrl,
+      language,
+      tone
+    });
+  }
 
   const parsed = parseJsonLoose(text);
 
@@ -606,7 +784,7 @@ Return strict JSON only:
 }
 `;
 
-  const text = await generateTextWithGeminiVision({
+  const text = await generateCaptionWithGeminiVision({
     imageUrl,
     prompt,
     modelName: model
@@ -641,9 +819,7 @@ async function editImageWithGemini({
       {
         role: "user",
         parts: [
-          {
-            text: prompt
-          },
+          { text: prompt },
           imagePart
         ]
       }
@@ -663,7 +839,6 @@ async function editImageWithGemini({
   });
 
   const parts = response.data?.candidates?.[0]?.content?.parts || [];
-
   const imageOutput = parts.find((part) => part.inlineData || part.inline_data);
 
   if (!imageOutput) {
@@ -707,8 +882,83 @@ async function editImageWithGemini({
   };
 }
 
+async function markMediaPublished(mediaAssetId, publishedAt) {
+  if (!mediaAssetId) return;
+
+  requireSupabaseConfig();
+
+  await supabase
+    .from("media_assets")
+    .update({
+      is_published: true,
+      published_at: publishedAt,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", mediaAssetId);
+}
+
+async function publishScheduledPost(post) {
+  requireSupabaseConfig();
+
+  const nowIso = new Date().toISOString();
+
+  await supabase
+    .from("scheduled_posts")
+    .update({
+      status: "publishing",
+      publish_attempts: (post.publish_attempts || 0) + 1,
+      updated_at: nowIso
+    })
+    .eq("id", post.id);
+
+  try {
+    const result = await publishToInstagram({
+      mediaUrl: post.media_url,
+      imageUrl: post.image_url,
+      videoUrl: post.video_url,
+      mediaType: post.media_type,
+      caption: post.final_text || post.caption || ""
+    });
+
+    const publishedAt = new Date().toISOString();
+
+    const { data: updatedPost, error: updateError } = await supabase
+      .from("scheduled_posts")
+      .update({
+        status: "published",
+        meta_container_id: result.creationId,
+        meta_publish_id: result.publishId,
+        published_at: publishedAt,
+        error_message: null,
+        updated_at: publishedAt
+      })
+      .eq("id", post.id)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    await markMediaPublished(post.media_asset_id, publishedAt);
+
+    return updatedPost;
+  } catch (error) {
+    const errorMessage = JSON.stringify(error.response?.data || error.message);
+
+    await supabase
+      .from("scheduled_posts")
+      .update({
+        status: "failed",
+        error_message: errorMessage,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", post.id);
+
+    throw error;
+  }
+}
+
 /**
- * Root / Health
+ * ROOT / HEALTH
  */
 app.get("/", (req, res) => {
   res.json({
@@ -719,7 +969,8 @@ app.get("/", (req, res) => {
     graphVersion: GRAPH_VERSION,
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
-    )
+    ),
+    supabaseConfigured: Boolean(supabase)
   });
 });
 
@@ -731,19 +982,18 @@ app.get("/api/health", (req, res) => {
     graphVersion: GRAPH_VERSION,
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
-    )
+    ),
+    supabaseConfigured: Boolean(supabase)
   });
 });
 
 /**
- * Meta test
+ * META TEST
  */
 async function testMetaConnection() {
   requireMetaConfig();
 
-  const url = `${GRAPH_HOST}/${GRAPH_VERSION}/me`;
-
-  const response = await axios.get(url, {
+  const response = await axios.get(`${GRAPH_HOST}/${GRAPH_VERSION}/me`, {
     params: {
       fields: "user_id,username",
       access_token: META_ACCESS_TOKEN
@@ -765,7 +1015,6 @@ app.get("/api/meta/test-connection", async (req, res) => {
     const result = await testMetaConnection();
     res.json({ ok: true, ...result });
   } catch (error) {
-    console.error("Meta test failed:", error.response?.data || error.message);
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -778,7 +1027,6 @@ app.post("/api/meta/test-connection", async (req, res) => {
     const result = await testMetaConnection();
     res.json({ ok: true, ...result });
   } catch (error) {
-    console.error("Meta test failed:", error.response?.data || error.message);
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -787,11 +1035,12 @@ app.post("/api/meta/test-connection", async (req, res) => {
 });
 
 /**
- * Upload media to Cloudinary
+ * MEDIA UPLOAD / LIBRARY
  */
 app.post("/api/upload", upload.any(), async (req, res) => {
   try {
     requireCloudinaryConfig();
+    requireSupabaseConfig();
 
     const file = req.files?.[0];
 
@@ -820,8 +1069,27 @@ app.post("/api/upload", upload.any(), async (req, res) => {
       uploaded = await uploadVideo(file);
     }
 
+    const { data: media, error } = await supabase
+      .from("media_assets")
+      .insert({
+        media_url: uploaded.mediaUrl,
+        image_url: uploaded.imageUrl,
+        video_url: uploaded.videoUrl,
+        media_type: uploaded.mediaType,
+        mime_type: uploaded.mimeType,
+        file_name: file.originalname || null,
+        is_uploaded: true,
+        is_scheduled: false,
+        is_published: false
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
     res.json({
       ok: true,
+      media,
       url: uploaded.mediaUrl,
       mediaUrl: uploaded.mediaUrl,
       media_url: uploaded.mediaUrl,
@@ -838,9 +1106,7 @@ app.post("/api/upload", upload.any(), async (req, res) => {
     console.error("Upload failed:", error.response?.data || error.message);
 
     if (req.files) {
-      for (const file of req.files) {
-        cleanupFile(file.path);
-      }
+      for (const file of req.files) cleanupFile(file.path);
     }
 
     res.status(500).json({
@@ -850,8 +1116,54 @@ app.post("/api/upload", upload.any(), async (req, res) => {
   }
 });
 
+app.get("/api/media", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("media_assets")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      media: data || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.delete("/api/media/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { error } = await supabase
+      .from("media_assets")
+      .delete()
+      .eq("id", req.params.id);
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      deleted: true
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
 /**
- * Debug inspect URL
+ * DEBUG URL
  */
 app.post("/api/debug/inspect-url", async (req, res) => {
   try {
@@ -897,12 +1209,15 @@ app.post("/api/debug/inspect-url", async (req, res) => {
 });
 
 /**
- * Publish Now
+ * PUBLISH NOW
  */
 app.post("/api/meta/publish-now", async (req, res) => {
   try {
-    const { mediaUrl, imageUrl, videoUrl, mediaType } = normalizeMediaInput(req.body);
-    const caption = req.body.caption || req.body.final_text || req.body.finalText || "";
+    const { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
+      normalizeMediaInput(req.body);
+
+    const caption =
+      req.body.caption || req.body.final_text || req.body.finalText || "";
 
     const result = await publishToInstagram({
       mediaUrl,
@@ -912,13 +1227,15 @@ app.post("/api/meta/publish-now", async (req, res) => {
       caption
     });
 
+    if (mediaAssetId) {
+      await markMediaPublished(mediaAssetId, new Date().toISOString());
+    }
+
     res.json({
       ok: true,
       result
     });
   } catch (error) {
-    console.error("Publish now failed:", error.response?.data || error.message);
-
     const metaError = error.response?.data || error.message;
 
     res.status(500).json({
@@ -928,86 +1245,188 @@ app.post("/api/meta/publish-now", async (req, res) => {
         error.response?.data?.error?.code === 9004
           ? "Meta could not fetch this media URL. Re-upload the file and make sure Cloudinary URL is used."
           : error.response?.data?.error?.code === 9007
-            ? "Meta media is not ready yet. The backend waited and retried, but Meta still did not make it available."
+            ? "Meta media was not ready. Backend waited and retried but Meta still rejected it."
             : undefined
     });
   }
 });
 
 /**
- * Gemini models
+ * AI MODELS
  */
-app.post("/api/gemini/list-models", async (req, res) => {
+app.post("/api/ai/list-models", async (req, res) => {
   try {
-    const apiKey = req.body.apiKey || GEMINI_API_KEY;
+    const provider = normalizeProvider(req.body.provider);
+    const apiKey = getProviderApiKey({
+      provider,
+      apiKey: req.body.apiKey
+    });
 
     if (!apiKey) {
       return res.status(400).json({
         ok: false,
-        error: "Gemini API key is required."
+        error: `Missing API key for provider: ${provider}`
       });
     }
 
-    const response = await axios.get(
-      "https://generativelanguage.googleapis.com/v1beta/models",
-      {
-        params: { key: apiKey },
+    let normalizedModels = [];
+
+    if (provider === "gemini") {
+      const response = await axios.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        {
+          params: { key: apiKey },
+          timeout: 30000
+        }
+      );
+
+      normalizedModels = (response.data.models || []).map((model) => {
+        const id = String(model.name || "").replace("models/", "");
+        return classifyModel("gemini", id, model);
+      });
+    }
+
+    if (provider === "openai") {
+      const response = await axios.get("https://api.openai.com/v1/models", {
+        headers: { Authorization: `Bearer ${apiKey}` },
         timeout: 30000
-      }
-    );
+      });
 
-    const models = response.data.models || [];
+      normalizedModels = (response.data.data || []).map((model) =>
+        classifyModel("openai", model.id, {
+          name: model.id,
+          displayName: model.id
+        })
+      );
+    }
 
-    const normalizedModels = models.map((model) => {
-      const fullName = model.name || "";
-      const shortName = fullName.replace("models/", "");
+    if (provider === "openrouter") {
+      const response = await axios.get("https://openrouter.ai/api/v1/models", {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        timeout: 30000
+      });
 
-      return {
-        name: fullName,
-        id: shortName,
-        displayName: model.displayName || shortName,
-        description: model.description || "",
-        supportedGenerationMethods: model.supportedGenerationMethods || []
-      };
-    });
-
-    const textModels = normalizedModels
-      .filter((model) => {
-        const methods = model.supportedGenerationMethods || [];
-        const id = model.id.toLowerCase();
-
-        return (
-          methods.includes("generateContent") &&
-          !id.includes("embedding") &&
-          !id.includes("aqa")
-        );
-      })
-      .map((model) => model.id);
-
-    const imageModels = normalizedModels
-      .filter((model) => {
-        const methods = model.supportedGenerationMethods || [];
-        const id = model.id.toLowerCase();
-
-        return (
-          methods.includes("generateContent") &&
-          (id.includes("image") ||
-            id.includes("imagen") ||
-            id.includes("flash-image") ||
-            id.includes("nano"))
-        );
-      })
-      .map((model) => model.id);
+      normalizedModels = (response.data.data || []).map((model) =>
+        classifyModel("openrouter", model.id, {
+          name: model.id,
+          displayName: model.name || model.id,
+          description: model.description || "",
+          pricing: model.pricing || {}
+        })
+      );
+    }
 
     res.json({
       ok: true,
+      provider,
       models: normalizedModels,
-      textModels,
-      imageModels
+      textModels: normalizedModels.filter((m) => m.supportsText).map((m) => m.id),
+      imageModels: normalizedModels.filter((m) => m.supportsImage).map((m) => m.id),
+      videoModels: normalizedModels.filter((m) => m.supportsVideo).map((m) => m.id),
+      freeModels: normalizedModels.filter((m) => m.isFree).map((m) => m.id)
     });
   } catch (error) {
-    console.error("Gemini list models failed:", error.response?.data || error.message);
+    console.error("AI list models failed:", error.response?.data || error.message);
 
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
+app.post("/api/gemini/list-models", async (req, res) => {
+  req.body.provider = "gemini";
+  return app._router.handle(req, res);
+});
+
+app.post("/api/ai/test-model", async (req, res) => {
+  try {
+    const provider = normalizeProvider(req.body.provider);
+    const model = String(req.body.model || "").trim();
+
+    const apiKey = getProviderApiKey({
+      provider,
+      apiKey: req.body.apiKey
+    });
+
+    if (!apiKey) {
+      return res.status(400).json({
+        ok: false,
+        error: `Missing API key for provider: ${provider}`
+      });
+    }
+
+    if (!model) {
+      return res.status(400).json({
+        ok: false,
+        error: "model is required."
+      });
+    }
+
+    if (provider === "gemini") {
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: 'Return strict JSON only: {"ok": true, "message": "AI connected"}'
+                }
+              ]
+            }
+          ]
+        },
+        {
+          params: { key: apiKey },
+          headers: { "Content-Type": "application/json" },
+          timeout: 60000
+        }
+      );
+
+      return res.json({
+        ok: true,
+        provider,
+        model,
+        raw: response.data
+      });
+    }
+
+    const endpoint =
+      provider === "openrouter"
+        ? "https://openrouter.ai/api/v1/chat/completions"
+        : "https://api.openai.com/v1/chat/completions";
+
+    const response = await axios.post(
+      endpoint,
+      {
+        model,
+        messages: [
+          {
+            role: "user",
+            content:
+              'Return strict JSON only: {"ok": true, "message": "AI connected"}'
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 60000
+      }
+    );
+
+    res.json({
+      ok: true,
+      provider,
+      model,
+      raw: response.data
+    });
+  } catch (error) {
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1017,8 +1436,6 @@ app.post("/api/gemini/list-models", async (req, res) => {
 
 app.post("/api/gemini/test", async (req, res) => {
   try {
-    requireGeminiConfig();
-
     const model = req.body.model || GEMINI_TEXT_MODEL;
 
     const text = await generateTextWithGemini(
@@ -1033,7 +1450,6 @@ app.post("/api/gemini/test", async (req, res) => {
       model
     });
   } catch (error) {
-    console.error("Gemini test failed:", error.response?.data || error.message);
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1042,17 +1458,13 @@ app.post("/api/gemini/test", async (req, res) => {
 });
 
 /**
- * Caption
+ * CAPTION / EDIT PROMPT / IMAGE EDIT
  */
 app.post("/api/gemini/generate-caption", async (req, res) => {
   try {
     const imageUrl =
       getBodyValue(req.body, "imageUrl", "image_url") ||
       getBodyValue(req.body, "mediaUrl", "media_url");
-
-    const language = req.body.language || "arabic";
-    const tone = req.body.tone || "premium";
-    const model = req.body.model || req.body.selectedModel || GEMINI_TEXT_MODEL;
 
     if (!imageUrl) {
       return res.status(400).json({
@@ -1061,11 +1473,13 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
       });
     }
 
-    const result = await generateCaptionWithGemini({
+    const result = await generateCaptionWithAI({
+      provider: req.body.provider || "gemini",
+      apiKey: req.body.apiKey,
       imageUrl,
-      language,
-      tone,
-      model
+      language: req.body.language || "arabic",
+      tone: req.body.tone || "premium",
+      model: req.body.model || GEMINI_TEXT_MODEL
     });
 
     res.json({
@@ -1073,7 +1487,6 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
       result
     });
   } catch (error) {
-    console.error("Generate caption failed:", error.response?.data || error.message);
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1081,20 +1494,11 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
   }
 });
 
-/**
- * Generate edit prompt
- */
 app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
   try {
     const imageUrl =
       getBodyValue(req.body, "imageUrl", "image_url") ||
       getBodyValue(req.body, "mediaUrl", "media_url");
-
-    const editStyle =
-      req.body.editStyle || req.body.edit_style || "luxury interior background";
-
-    const language = req.body.language || "english";
-    const model = req.body.model || req.body.selectedModel || GEMINI_TEXT_MODEL;
 
     if (!imageUrl) {
       return res.status(400).json({
@@ -1105,9 +1509,10 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
 
     const result = await generateEditPromptWithGemini({
       imageUrl,
-      editStyle,
-      language,
-      model
+      editStyle:
+        req.body.editStyle || req.body.edit_style || "luxury interior background",
+      language: req.body.language || "english",
+      model: req.body.model || GEMINI_TEXT_MODEL
     });
 
     res.json({
@@ -1115,7 +1520,6 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
       result
     });
   } catch (error) {
-    console.error("Generate edit prompt failed:", error.response?.data || error.message);
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1123,9 +1527,6 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
   }
 });
 
-/**
- * AI image editing
- */
 app.post("/api/ai/edit-image", async (req, res) => {
   try {
     const originalImageUrl =
@@ -1133,15 +1534,14 @@ app.post("/api/ai/edit-image", async (req, res) => {
       getBodyValue(req.body, "imageUrl", "image_url") ||
       getBodyValue(req.body, "mediaUrl", "media_url");
 
-    const prompt = req.body.prompt || req.body.ai_edit_prompt || "";
-    const model = req.body.model || GEMINI_IMAGE_MODEL;
-
     if (!originalImageUrl) {
       return res.status(400).json({
         ok: false,
         error: "originalImageUrl is required."
       });
     }
+
+    const prompt = req.body.prompt || req.body.ai_edit_prompt || "";
 
     if (!prompt) {
       return res.status(400).json({
@@ -1153,7 +1553,7 @@ app.post("/api/ai/edit-image", async (req, res) => {
     const result = await editImageWithGemini({
       originalImageUrl,
       prompt,
-      model
+      model: req.body.model || GEMINI_IMAGE_MODEL
     });
 
     res.json({
@@ -1161,7 +1561,6 @@ app.post("/api/ai/edit-image", async (req, res) => {
       result
     });
   } catch (error) {
-    console.error("AI edit image failed:", error.response?.data || error.message);
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1170,202 +1569,231 @@ app.post("/api/ai/edit-image", async (req, res) => {
 });
 
 /**
- * Create scheduled post
+ * POSTS
  */
-app.post("/api/posts", (req, res) => {
-  const { mediaUrl, imageUrl, videoUrl, mediaType } = normalizeMediaInput(req.body);
-
-  const caption = req.body.caption || "";
-  const hashtags = normalizeHashtags(req.body.hashtags);
-  const scheduledAt = getBodyValue(req.body, "scheduledAt", "scheduled_at");
-
-  if (!mediaUrl || !scheduledAt) {
-    return res.status(400).json({
-      ok: false,
-      error: "mediaUrl and scheduledAt are required."
-    });
-  }
-
-  if (mediaType !== "image" && mediaType !== "video") {
-    return res.status(400).json({
-      ok: false,
-      error: "mediaType must be image or video."
-    });
-  }
-
-  const now = new Date().toISOString();
-  const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
-
-  const post = {
-    id: randomUUID(),
-
-    mediaUrl,
-    media_url: mediaUrl,
-
-    imageUrl,
-    image_url: imageUrl,
-
-    videoUrl,
-    video_url: videoUrl,
-
-    mediaType,
-    media_type: mediaType,
-
-    caption,
-    hashtags,
-
-    finalText,
-    final_text: finalText,
-
-    scheduledAt,
-    scheduled_at: scheduledAt,
-
-    status: "approved",
-
-    publishAttempts: 0,
-    publish_attempts: 0,
-
-    metaContainerId: null,
-    meta_container_id: null,
-
-    metaPublishId: null,
-    meta_publish_id: null,
-
-    errorMessage: null,
-    error_message: null,
-
-    createdAt: now,
-    created_at: now,
-
-    updatedAt: now,
-    updated_at: now,
-
-    publishedAt: null,
-    published_at: null
-  };
-
-  posts.push(post);
-
-  res.json({
-    ok: true,
-    post
-  });
-});
-
-app.get("/api/posts", (req, res) => {
-  res.json({
-    ok: true,
-    posts
-  });
-});
-
-app.post("/api/posts/:id/retry", async (req, res) => {
-  const post = posts.find((item) => item.id === req.params.id);
-
-  if (!post) {
-    return res.status(404).json({
-      ok: false,
-      error: "Post not found."
-    });
-  }
-
+app.post("/api/posts", async (req, res) => {
   try {
-    post.status = "publishing";
-    post.publishAttempts += 1;
-    post.publish_attempts = post.publishAttempts;
-    post.updatedAt = new Date().toISOString();
-    post.updated_at = post.updatedAt;
+    requireSupabaseConfig();
 
-    const result = await publishToInstagram({
-      mediaUrl: post.mediaUrl,
-      imageUrl: post.imageUrl,
-      videoUrl: post.videoUrl,
-      mediaType: post.mediaType,
-      caption: post.finalText
-    });
+    const { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
+      normalizeMediaInput(req.body);
 
-    post.status = "published";
-    post.metaContainerId = result.creationId;
-    post.meta_container_id = result.creationId;
-    post.metaPublishId = result.publishId;
-    post.meta_publish_id = result.publishId;
-    post.publishedAt = new Date().toISOString();
-    post.published_at = post.publishedAt;
-    post.updatedAt = new Date().toISOString();
-    post.updated_at = post.updatedAt;
-    post.errorMessage = null;
-    post.error_message = null;
+    const caption = req.body.caption || "";
+    const hashtags = normalizeHashtags(req.body.hashtags);
+    const scheduledAt = getBodyValue(req.body, "scheduledAt", "scheduled_at");
+
+    if (!mediaUrl || !scheduledAt) {
+      return res.status(400).json({
+        ok: false,
+        error: "mediaUrl and scheduledAt are required."
+      });
+    }
+
+    if (mediaType !== "image" && mediaType !== "video") {
+      return res.status(400).json({
+        ok: false,
+        error: "mediaType must be image or video."
+      });
+    }
+
+    const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
+
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .insert({
+        media_asset_id: mediaAssetId,
+        media_url: mediaUrl,
+        image_url: imageUrl,
+        video_url: videoUrl,
+        media_type: mediaType,
+        caption,
+        hashtags,
+        final_text: finalText,
+        scheduled_at: scheduledAt,
+        status: "approved"
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    if (mediaAssetId) {
+      await supabase
+        .from("media_assets")
+        .update({
+          is_scheduled: true,
+          scheduled_post_id: post.id,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", mediaAssetId);
+    }
 
     res.json({
       ok: true,
       post
     });
   } catch (error) {
-    post.status = "failed";
-    post.errorMessage = JSON.stringify(error.response?.data || error.message);
-    post.error_message = post.errorMessage;
-    post.updatedAt = new Date().toISOString();
-    post.updated_at = post.updatedAt;
-
     res.status(500).json({
       ok: false,
-      post
+      error: error.message
+    });
+  }
+});
+
+app.get("/api/posts", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("scheduled_posts")
+      .select("*")
+      .order("scheduled_at", { ascending: true });
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      posts: data || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.patch("/api/posts/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const update = {};
+
+    if (req.body.caption !== undefined) update.caption = req.body.caption;
+    if (req.body.hashtags !== undefined) {
+      update.hashtags = normalizeHashtags(req.body.hashtags);
+    }
+    if (req.body.finalText !== undefined || req.body.final_text !== undefined) {
+      update.final_text = req.body.finalText || req.body.final_text;
+    }
+    if (req.body.scheduledAt !== undefined || req.body.scheduled_at !== undefined) {
+      update.scheduled_at = req.body.scheduledAt || req.body.scheduled_at;
+    }
+    if (req.body.status !== undefined) update.status = req.body.status;
+
+    update.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("scheduled_posts")
+      .update(update)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      post: data
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.delete("/api/posts/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("scheduled_posts")
+      .update({
+        status: "cancelled",
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      post: data
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/api/posts/:id/retry", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error) throw error;
+
+    const updatedPost = await publishScheduledPost(post);
+
+    res.json({
+      ok: true,
+      post: updatedPost
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message
     });
   }
 });
 
 /**
- * Cron scheduler
+ * CRON SCHEDULER
  */
 cron.schedule("*/5 * * * *", async () => {
-  const now = new Date();
-
-  const duePosts = posts.filter((post) => {
-    return (
-      post.status === "approved" &&
-      new Date(post.scheduledAt) <= now &&
-      post.publishAttempts < 3
-    );
-  });
-
-  for (const post of duePosts) {
-    try {
-      post.status = "publishing";
-      post.publishAttempts += 1;
-      post.publish_attempts = post.publishAttempts;
-      post.updatedAt = new Date().toISOString();
-      post.updated_at = post.updatedAt;
-
-      const result = await publishToInstagram({
-        mediaUrl: post.mediaUrl,
-        imageUrl: post.imageUrl,
-        videoUrl: post.videoUrl,
-        mediaType: post.mediaType,
-        caption: post.finalText
-      });
-
-      post.status = "published";
-      post.metaContainerId = result.creationId;
-      post.meta_container_id = result.creationId;
-      post.metaPublishId = result.publishId;
-      post.meta_publish_id = result.publishId;
-      post.publishedAt = new Date().toISOString();
-      post.published_at = post.publishedAt;
-      post.updatedAt = new Date().toISOString();
-      post.updated_at = post.updatedAt;
-      post.errorMessage = null;
-      post.error_message = null;
-
-      console.log(`Published post ${post.id}`);
-    } catch (error) {
-      post.status = "failed";
-      post.errorMessage = JSON.stringify(error.response?.data || error.message);
-      post.error_message = post.errorMessage;
-      post.updatedAt = new Date().toISOString();
-      post.updated_at = post.updatedAt;
-
-      console.error(`Failed post ${post.id}:`, post.errorMessage);
+  try {
+    if (!supabase) {
+      console.warn("Supabase not configured. Cron skipped.");
+      return;
     }
+
+    const nowIso = new Date().toISOString();
+
+    const { data: duePosts, error } = await supabase
+      .from("scheduled_posts")
+      .select("*")
+      .in("status", ["approved", "scheduled"])
+      .lte("scheduled_at", nowIso)
+      .lt("publish_attempts", 3)
+      .order("scheduled_at", { ascending: true })
+      .limit(10);
+
+    if (error) throw error;
+
+    for (const post of duePosts || []) {
+      try {
+        console.log(`Cron publishing post ${post.id}`);
+        await publishScheduledPost(post);
+      } catch (error) {
+        console.error(
+          `Failed scheduled post ${post.id}:`,
+          error.response?.data || error.message
+        );
+      }
+    }
+  } catch (error) {
+    console.error("Cron scheduler failed:", error.message);
   }
 });
 
