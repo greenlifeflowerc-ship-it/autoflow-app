@@ -30,8 +30,11 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const INSTAGRAM_GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
-const META_GRAPH_HOST = process.env.META_GRAPH_HOST || "https://graph.facebook.com";
+const INSTAGRAM_GRAPH_HOST =
+  process.env.GRAPH_HOST || "https://graph.instagram.com";
+const META_GRAPH_HOST =
+  process.env.META_GRAPH_HOST || "https://graph.facebook.com";
+
 const GRAPH_VERSION =
   process.env.GRAPH_VERSION || process.env.META_GRAPH_VERSION || "v25.0";
 
@@ -48,19 +51,18 @@ const AUTO_REPLY_ENABLED =
   String(process.env.AUTO_REPLY_ENABLED || "false").toLowerCase() === "true";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const AI_DEFAULT_PROVIDER = process.env.AI_DEFAULT_PROVIDER || "gemini";
-
 const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
-const DEFAULT_BUSINESS_NAME = process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
+const AI_DEFAULT_PROVIDER = process.env.AI_DEFAULT_PROVIDER || "gemini";
+const AI_BULK_CONCURRENCY = Number(process.env.AI_BULK_CONCURRENCY || 2);
+
+const DEFAULT_BUSINESS_NAME =
+  process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
 const DEFAULT_LOCATION = process.env.DEFAULT_LOCATION || "UAE";
 const DEFAULT_CTA = process.env.DEFAULT_CTA || "Contact us today";
 const DEFAULT_HASHTAG_COUNT = Number(process.env.DEFAULT_HASHTAG_COUNT || 10);
-const AI_BULK_CONCURRENCY = Number(process.env.AI_BULK_CONCURRENCY || 2);
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
@@ -117,24 +119,50 @@ function requireCloudinaryConfig() {
   }
 }
 
-function requireMetaPublishConfig() {
-  if (!META_ACCESS_TOKEN || !IG_USER_ID) {
-    throw new Error("Missing META_ACCESS_TOKEN or IG_USER_ID.");
+function requireInstagramConfig() {
+  if (!IG_USER_ID || !META_ACCESS_TOKEN) {
+    throw new Error("Missing IG_USER_ID or META_ACCESS_TOKEN.");
   }
 }
 
-function requireGeminiConfig(apiKey = GEMINI_API_KEY) {
-  if (!apiKey) {
+function requireGeminiConfig() {
+  if (!GEMINI_API_KEY) {
     throw new Error("Missing GEMINI_API_KEY.");
   }
 }
 
+function cleanAccessToken(token) {
+  return String(token || "")
+    .trim()
+    .replace(/^Bearer\s+/i, "")
+    .replace(/^["']|["']$/g, "")
+    .replace(/\s+/g, "");
+}
+
+function getInstagramToken() {
+  return cleanAccessToken(META_ACCESS_TOKEN);
+}
+
+function getPageToken() {
+  return cleanAccessToken(FACEBOOK_PAGE_ACCESS_TOKEN);
+}
+
+function isLikelyInstagramToken(token) {
+  const clean = cleanAccessToken(token);
+  return clean.startsWith("IG") || clean.startsWith("IGA");
+}
+
+function isLikelyFacebookToken(token) {
+  const clean = cleanAccessToken(token);
+  return clean.startsWith("EA");
+}
+
 function hasInstagramTokenConfig() {
-  return Boolean(META_ACCESS_TOKEN && IG_USER_ID);
+  return Boolean(IG_USER_ID && getInstagramToken());
 }
 
 function hasPageTokenConfig() {
-  return Boolean(FACEBOOK_PAGE_ID && FACEBOOK_PAGE_ACCESS_TOKEN);
+  return Boolean(FACEBOOK_PAGE_ID && getPageToken());
 }
 
 function buildGraphUrl(host, pathValue) {
@@ -153,126 +181,145 @@ function metaGraphUrl(pathValue) {
   return buildGraphUrl(META_GRAPH_HOST, pathValue);
 }
 
-function createCombinedGraphError(pathValue, instagramError, metaError) {
-  const message = {
-    message: `Graph request failed on both Instagram Graph and Meta Graph for ${pathValue}.`,
-    instagramGraphError: instagramError?.response?.data || instagramError?.message || null,
-    metaGraphError: metaError?.response?.data || metaError?.message || null,
+function createGraphError(pathValue, errors) {
+  const error = new Error(`Graph request failed for ${pathValue}.`);
+  error.details = {
+    path: pathValue,
+    errors,
   };
-
-  const error = new Error(message.message);
-  error.details = message;
   return error;
 }
 
-async function graphGetWithFallback(pathValue, params = {}, options = {}) {
+/**
+ * CRITICAL FIX:
+ * - If token starts IG / IGA => use graph.instagram.com only.
+ * - If token starts EA => use graph.facebook.com first.
+ * This prevents "Cannot parse access token" when IG token is sent to Meta Graph.
+ */
+async function graphGet(pathValue, params = {}, options = {}) {
+  const token = cleanAccessToken(
+    params.access_token ||
+      options.accessToken ||
+      META_ACCESS_TOKEN ||
+      FACEBOOK_PAGE_ACCESS_TOKEN,
+  );
+
+  if (!token) {
+    throw new Error("Missing access token.");
+  }
+
   const mergedParams = {
     ...params,
-    access_token: params.access_token || META_ACCESS_TOKEN,
+    access_token: token,
   };
 
-  let instagramError = null;
-  let metaError = null;
+  const errors = [];
+  const tokenIsInstagram = isLikelyInstagramToken(token);
+  const tokenIsFacebook = isLikelyFacebookToken(token);
 
-  if (options.preferMeta !== true) {
+  let hostOrder = [];
+
+  if (tokenIsInstagram) {
+    hostOrder = ["instagram"];
+  } else if (tokenIsFacebook) {
+    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+  } else {
+    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+  }
+
+  for (const hostType of hostOrder) {
+    const url =
+      hostType === "instagram"
+        ? instagramGraphUrl(pathValue)
+        : metaGraphUrl(pathValue);
+
     try {
-      return await axios.get(instagramGraphUrl(pathValue), {
+      return await axios.get(url, {
         params: mergedParams,
         timeout: options.timeout || 30000,
       });
     } catch (error) {
-      instagramError = error;
-      console.warn(
-        `Instagram Graph GET failed ${pathValue}:`,
-        error.response?.data || error.message,
-      );
-    }
-  }
+      const err = error.response?.data || error.message;
 
-  try {
-    return await axios.get(metaGraphUrl(pathValue), {
-      params: mergedParams,
-      timeout: options.timeout || 30000,
-    });
-  } catch (error) {
-    metaError = error;
-    console.warn(
-      `Meta Graph GET failed ${pathValue}:`,
-      error.response?.data || error.message,
-    );
-  }
-
-  if (options.preferMeta === true) {
-    try {
-      return await axios.get(instagramGraphUrl(pathValue), {
-        params: mergedParams,
-        timeout: options.timeout || 30000,
+      errors.push({
+        host: hostType,
+        url,
+        error: err,
       });
-    } catch (error) {
-      instagramError = error;
+
       console.warn(
-        `Instagram Graph GET fallback failed ${pathValue}:`,
-        error.response?.data || error.message,
+        `${hostType === "instagram" ? "Instagram" : "Meta"} Graph GET failed ${pathValue}:`,
+        err,
       );
+
+      if (tokenIsInstagram && hostType === "instagram") break;
     }
   }
 
-  throw createCombinedGraphError(pathValue, instagramError, metaError);
+  throw createGraphError(pathValue, errors);
 }
 
-async function graphPostWithFallback(pathValue, data = null, params = {}, options = {}) {
+async function graphPost(pathValue, data = null, params = {}, options = {}) {
+  const token = cleanAccessToken(
+    params.access_token ||
+      options.accessToken ||
+      META_ACCESS_TOKEN ||
+      FACEBOOK_PAGE_ACCESS_TOKEN,
+  );
+
+  if (!token) {
+    throw new Error("Missing access token.");
+  }
+
   const mergedParams = {
     ...params,
-    access_token: params.access_token || META_ACCESS_TOKEN,
+    access_token: token,
   };
 
-  let instagramError = null;
-  let metaError = null;
+  const errors = [];
+  const tokenIsInstagram = isLikelyInstagramToken(token);
+  const tokenIsFacebook = isLikelyFacebookToken(token);
 
-  if (options.preferMeta !== true) {
+  let hostOrder = [];
+
+  if (tokenIsInstagram) {
+    hostOrder = ["instagram"];
+  } else if (tokenIsFacebook) {
+    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+  } else {
+    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+  }
+
+  for (const hostType of hostOrder) {
+    const url =
+      hostType === "instagram"
+        ? instagramGraphUrl(pathValue)
+        : metaGraphUrl(pathValue);
+
     try {
-      return await axios.post(instagramGraphUrl(pathValue), data, {
+      return await axios.post(url, data, {
         params: mergedParams,
         timeout: options.timeout || 30000,
       });
     } catch (error) {
-      instagramError = error;
-      console.warn(
-        `Instagram Graph POST failed ${pathValue}:`,
-        error.response?.data || error.message,
-      );
-    }
-  }
+      const err = error.response?.data || error.message;
 
-  try {
-    return await axios.post(metaGraphUrl(pathValue), data, {
-      params: mergedParams,
-      timeout: options.timeout || 30000,
-    });
-  } catch (error) {
-    metaError = error;
-    console.warn(
-      `Meta Graph POST failed ${pathValue}:`,
-      error.response?.data || error.message,
-    );
-  }
-
-  if (options.preferMeta === true) {
-    try {
-      return await axios.post(instagramGraphUrl(pathValue), data, {
-        params: mergedParams,
-        timeout: options.timeout || 30000,
+      errors.push({
+        host: hostType,
+        url,
+        error: err,
       });
-    } catch (error) {
-      instagramError = error;
+
       console.warn(
-        `Instagram Graph POST fallback failed ${pathValue}:`,
-        error.response?.data || error.message,
+        `${hostType === "instagram" ? "Instagram" : "Meta"} Graph POST failed ${pathValue}:`,
+        err,
       );
+
+      if (tokenIsInstagram && hostType === "instagram") break;
     }
   }
 
-  throw createCombinedGraphError(pathValue, instagramError, metaError);
+  throw createGraphError(pathValue, errors);
 }
 
 function cleanupFile(filePath) {
@@ -281,7 +328,7 @@ function cleanupFile(filePath) {
       fs.unlinkSync(filePath);
     }
   } catch {
-    // ignore
+    // ignore cleanup errors
   }
 }
 
@@ -296,6 +343,7 @@ function isPublicHttpsUrl(url) {
 
 function isValidUuid(value) {
   if (!value) return false;
+
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     String(value).trim(),
   );
@@ -307,6 +355,7 @@ function firstDefined(...values) {
       return value;
     }
   }
+
   return null;
 }
 
@@ -391,9 +440,7 @@ function normalizeProvider(value) {
     .trim()
     .toLowerCase();
 
-  if (["gemini", "openai", "openrouter"].includes(provider)) {
-    return provider;
-  }
+  if (["gemini", "openai", "openrouter"].includes(provider)) return provider;
 
   return "gemini";
 }
@@ -404,8 +451,6 @@ function getProviderApiKey({ provider, apiKey }) {
   if (cleanKey.length > 0) return cleanKey;
 
   if (provider === "gemini") return GEMINI_API_KEY;
-  if (provider === "openai") return OPENAI_API_KEY;
-  if (provider === "openrouter") return OPENROUTER_API_KEY;
 
   return null;
 }
@@ -523,10 +568,6 @@ function withAliases(row) {
     scheduledAt: row.scheduled_at ?? row.scheduledAt,
     publishedAt: row.published_at ?? row.publishedAt,
     mediaAssetId: row.media_asset_id ?? row.mediaAssetId,
-    sourceMediaAssetId: row.source_media_asset_id ?? row.sourceMediaAssetId,
-    isAiGenerated: row.is_ai_generated ?? row.isAiGenerated,
-    isPublished: row.is_published ?? row.isPublished,
-    isScheduled: row.is_scheduled ?? row.isScheduled,
     conversationId: row.conversation_id ?? row.conversationId,
     igScopedUserId: row.ig_scoped_user_id ?? row.igScopedUserId,
     metaConversationId: row.meta_conversation_id ?? row.metaConversationId,
@@ -534,7 +575,6 @@ function withAliases(row) {
     lastMessageAt: row.last_message_at ?? row.lastMessageAt,
     unreadCount: row.unread_count ?? row.unreadCount,
     messageType: row.message_type ?? row.messageType,
-    mediaUrl: row.media_url ?? row.mediaUrl,
     sentAt: row.sent_at ?? row.sentAt,
   };
 }
@@ -549,13 +589,8 @@ async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
       .eq("id", mediaAssetId)
       .maybeSingle();
 
-    if (error) {
-      console.warn("Could not fetch media asset by UUID:", error.message);
-    }
-
+    if (error) console.warn("Could not fetch media asset by UUID:", error.message);
     if (data) return data;
-  } else if (mediaAssetId) {
-    console.warn("Ignoring non-UUID mediaAssetId:", mediaAssetId);
   }
 
   if (mediaUrl) {
@@ -565,10 +600,7 @@ async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
       .eq("media_url", mediaUrl)
       .maybeSingle();
 
-    if (error) {
-      console.warn("Could not fetch media asset by media_url:", error.message);
-    }
-
+    if (error) console.warn("Could not fetch media asset by media_url:", error.message);
     if (data) return data;
   }
 
@@ -682,7 +714,7 @@ async function pollMediaContainerStatus(containerId) {
       const response = await axios.get(instagramGraphUrl(`/${containerId}`), {
         params: {
           fields: "status_code,status",
-          access_token: META_ACCESS_TOKEN,
+          access_token: getInstagramToken(),
         },
         timeout: 30000,
       });
@@ -707,7 +739,7 @@ async function pollMediaContainerStatus(containerId) {
 }
 
 async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, caption }) {
-  requireMetaPublishConfig();
+  requireInstagramConfig();
 
   const finalMediaUrl = mediaUrl || imageUrl || videoUrl;
   const finalMediaType = mediaType || detectMediaTypeFromUrl(finalMediaUrl);
@@ -722,7 +754,7 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
 
   const params = {
     caption: caption || "",
-    access_token: META_ACCESS_TOKEN,
+    access_token: getInstagramToken(),
   };
 
   if (finalMediaType === "image") {
@@ -746,9 +778,7 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
 
   const creationId = containerResponse.data?.id;
 
-  if (!creationId) {
-    throw new Error("Meta did not return creation_id.");
-  }
+  if (!creationId) throw new Error("Meta did not return creation_id.");
 
   await pollMediaContainerStatus(creationId);
 
@@ -762,11 +792,12 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
         {
           params: {
             creation_id: creationId,
-            access_token: META_ACCESS_TOKEN,
+            access_token: getInstagramToken(),
           },
           timeout: 60000,
         },
       );
+
       break;
     } catch (error) {
       const metaCode = error.response?.data?.error?.code;
@@ -781,9 +812,7 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
     }
   }
 
-  if (!publishResponse?.data?.id) {
-    throw new Error("Meta did not return publish ID.");
-  }
+  if (!publishResponse?.data?.id) throw new Error("Meta did not return publish ID.");
 
   return {
     creationId,
@@ -791,39 +820,6 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
     mediaType: finalMediaType,
     mediaUrl: finalMediaUrl,
   };
-}
-
-function getPresetInstruction(captionPreset, customPrompt) {
-  const preset = String(captionPreset || "Luxury Product Caption").trim();
-
-  if (preset === "Custom Prompt") {
-    return customPrompt && String(customPrompt).trim()
-      ? String(customPrompt).trim()
-      : "Write a premium Instagram caption based on the visible product and scene.";
-  }
-
-  const presets = {
-    "Luxury Product Caption":
-      "Focus on premium decor, elegance, high-end styling, luxury ambience, and refined taste.",
-    "Artificial Tree Marketing":
-      "Focus on realistic artificial trees, no maintenance, custom sizes, greenery styling, and indoor/outdoor decor.",
-    "Artificial Flower Arrangement":
-      "Focus on flower colors, arrangement style, luxury floral styling, events, interiors, and decorative impact.",
-    "Interior Design Decor":
-      "Focus on how the product improves the interior space, ambience, warmth, balance, and luxury decor.",
-    "Villa / Entrance Decor":
-      "Focus on villa entrances, majlis, welcoming first impression, elegant greenery, and premium home decor.",
-    "Hotel / Mall / Commercial Decor":
-      "Focus on commercial spaces, hotels, malls, offices, durability, visual impact, and professional installation.",
-    "Short Premium Caption":
-      "Write one short, elegant, direct caption. Keep it premium and minimal.",
-    "Arabic Social Media Caption":
-      "Write natural Arabic social media copy. Make it premium but not stiff or over-formal.",
-    "Before / After Style":
-      "Write like a transformation post. Emphasize how the decor changes the feeling of the space.",
-  };
-
-  return presets[preset] || presets["Luxury Product Caption"];
 }
 
 function buildCaptionPrompt({
@@ -836,21 +832,22 @@ function buildCaptionPrompt({
   cta,
   hashtagCount,
 }) {
-  const presetInstruction = getPresetInstruction(captionPreset, customPrompt);
   const safeHashtagCount = Number.isFinite(Number(hashtagCount))
     ? Math.max(3, Math.min(25, Number(hashtagCount)))
     : DEFAULT_HASHTAG_COUNT;
 
+  const preset = captionPreset || "Luxury Product Caption";
+  const custom = customPrompt ? `Custom instruction:\n${customPrompt}` : "";
+
   return `
 You are a senior Instagram marketing copywriter for ${businessName}, a ${location}-based company specializing in premium artificial trees, artificial flowers, custom greenery, and luxury decor installations.
 
-Analyze the image carefully before writing.
+Analyze the image carefully and write content that matches the actual visible product.
 
 Caption preset:
-${captionPreset}
+${preset}
 
-Preset instruction:
-${presetInstruction}
+${custom}
 
 Language:
 ${language}
@@ -867,7 +864,7 @@ ${safeHashtagCount}
 Return strict JSON only:
 {
   "caption": "caption here",
-  "hashtags": ["#hashtag1", "#hashtag2"],
+  "hashtags": ["#tag1", "#tag2"],
   "alt_text": "short alt text",
   "detected_product": "what the image shows",
   "visual_description": "short visual analysis",
@@ -877,7 +874,6 @@ Return strict JSON only:
 Rules:
 - Caption must be specific to the image.
 - Do not use placeholders.
-- Do not write "#hashtag1".
 - Do not invent discounts, offers, guarantees, or prices.
 - Do not mention AI.
 - Arabic must sound natural and premium.
@@ -885,159 +881,15 @@ Rules:
 `;
 }
 
-function buildFixedAiEditRules({
-  preserveProduct = true,
-  keepPot = true,
-  outputSize = "1080x1350",
-  aspectRatio = "4:5",
-  resolution = 1080,
-  quality = "high",
-}) {
-  const rules = [
-    "The result must be photorealistic and look like real professional photography.",
-    "Keep natural perspective, believable scale, correct shadows, realistic lighting, and harmonious colors.",
-    "No cartoon, no painting, no CGI look, no artificial AI artifacts.",
-    "No text, no watermark.",
-  ];
-
-  if (preserveProduct) {
-    rules.push(
-      "Keep the original tree / plant / flower arrangement exactly unchanged.",
-      "Do NOT change product shape, structure, trunk, branches, leaves, flowers, colors, density, height, width, proportions, angle, or realism.",
-      "Preserve the original product identity exactly.",
-    );
-  }
-
-  if (keepPot) {
-    rules.push(
-      "Keep the pot / planter / base exactly unchanged unless explicitly asked.",
-      "Do NOT change pot shape, color, material, texture, size, or placement.",
-    );
-  }
-
-  rules.push(
-    "Change only the background, environment, surrounding decor, floor, walls, lighting, and atmosphere.",
-    `Output aspect ratio: ${aspectRatio}.`,
-    `Target output size: ${outputSize}.`,
-    `Target resolution: ${resolution}.`,
-    `Quality level: ${quality}.`,
-  );
-
-  return rules;
-}
-
-function getAiEditPresetInstruction(preset, customPrompt) {
-  const cleanPreset = String(preset || "Luxury Interior").trim();
-
-  if (cleanPreset === "Custom") {
-    return customPrompt && String(customPrompt).trim()
-      ? String(customPrompt).trim()
-      : "Create a realistic premium background that enhances the product.";
-  }
-
-  const presets = {
-    "Change Background":
-      "Replace the background with a clean premium realistic environment that suits the product.",
-    "Luxury Interior":
-      "Place the product in a refined luxury interior with warm neutral walls, elegant flooring, soft natural light, and premium decor.",
-    "Villa Entrance":
-      "Place the product in a luxurious villa entrance with elegant architecture, premium flooring, soft lighting, and a welcoming high-end atmosphere.",
-    "Staircase Decor":
-      "Create a realistic under-stair or staircase decor scene with elegant walls, premium flooring, soft lighting, stones or greenery accents where appropriate.",
-    "Minimal Modern Space":
-      "Place the product in a minimal modern interior with clean lines, warm neutral colors, subtle luxury, and calm composition.",
-    "Commercial / Mall Decor":
-      "Place the product in a realistic commercial interior such as a mall, showroom, lobby, or retail space with polished finishes and professional lighting.",
-    "Hotel Lobby Decor":
-      "Place the product in a luxury hotel lobby with elegant materials, soft ambient lighting, premium furniture, and a high-end hospitality feel.",
-    "Outdoor Courtyard":
-      "Place the product in a realistic outdoor courtyard with natural light, architectural walls, stone or marble floor, and subtle landscape details.",
-    "Neutral Studio Background":
-      "Place the product on a clean neutral studio background with realistic soft shadows and premium product photography lighting.",
-  };
-
-  return presets[cleanPreset] || presets["Luxury Interior"];
-}
-
-function buildAiEditPrompt({
-  preset = "Luxury Interior",
-  customPrompt = "",
-  editMode = "background_only",
-  preserveProduct = true,
-  keepPot = true,
-  aspectRatio = "4:5",
-  outputSize = "1080x1350",
-  resolution = 1080,
-  quality = "high",
-  backgroundIntensity = "medium",
-  userPrompt = "",
-}) {
-  const fixedRules = buildFixedAiEditRules({
-    preserveProduct,
-    keepPot,
-    outputSize,
-    aspectRatio,
-    resolution,
-    quality,
-  });
-
-  const presetInstruction = getAiEditPresetInstruction(preset, customPrompt);
-
-  return `
-Professional AI image edit request.
-
-Edit preset:
-${preset}
-
-Edit mode:
-${editMode}
-
-Background intensity:
-${backgroundIntensity}
-
-Main scene instruction:
-${userPrompt && String(userPrompt).trim() ? String(userPrompt).trim() : presetInstruction}
-
-Fixed preservation rules:
-${fixedRules.map((rule) => `- ${rule}`).join("\n")}
-
-Scene realism rules:
-- Match the original camera angle.
-- Product must sit naturally in the new space.
-- Scale must be believable.
-- Lighting direction must be consistent.
-- Shadows must be realistic and grounded.
-- Colors must be harmonious and not oversaturated.
-- Suitable for premium Instagram marketing.
-
-Return only the edited image.
-`;
-}
-
-async function generateTextWithGemini(
-  prompt,
-  modelName = GEMINI_TEXT_MODEL,
-  apiKey = GEMINI_API_KEY,
-) {
-  requireGeminiConfig(apiKey);
-
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: modelName });
-
-  const result = await model.generateContent(prompt);
-  return result.response.text();
-}
-
 async function generateVisionWithGemini({
   imageUrl,
   prompt,
   modelName = GEMINI_TEXT_MODEL,
-  apiKey = GEMINI_API_KEY,
   fallbackTextOnly = false,
 }) {
-  requireGeminiConfig(apiKey);
+  requireGeminiConfig();
 
-  const genAI = new GoogleGenerativeAI(apiKey);
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({ model: modelName });
 
   try {
@@ -1057,12 +909,10 @@ async function generateVisionWithGemini({
 }
 
 async function generateCaptionWithAI({
-  provider = "gemini",
-  apiKey,
   imageUrl,
   language = "arabic",
   tone = "premium",
-  model,
+  model = GEMINI_TEXT_MODEL,
   captionPreset = "Luxury Product Caption",
   customPrompt = "",
   businessName = DEFAULT_BUSINESS_NAME,
@@ -1071,13 +921,6 @@ async function generateCaptionWithAI({
   hashtagCount = DEFAULT_HASHTAG_COUNT,
   fallbackTextOnly = false,
 }) {
-  const selectedProvider = normalizeProvider(provider);
-  const selectedApiKey = getProviderApiKey({ provider: selectedProvider, apiKey });
-
-  if (!selectedApiKey) {
-    throw new Error(`Missing API key for provider: ${selectedProvider}`);
-  }
-
   const prompt = buildCaptionPrompt({
     language,
     tone,
@@ -1089,15 +932,10 @@ async function generateCaptionWithAI({
     hashtagCount,
   });
 
-  if (selectedProvider !== "gemini") {
-    throw new Error("Caption generation currently supports Gemini in this backend.");
-  }
-
   const text = await generateVisionWithGemini({
     imageUrl,
     prompt,
     modelName: model || GEMINI_TEXT_MODEL,
-    apiKey: selectedApiKey,
     fallbackTextOnly,
   });
 
@@ -1124,30 +962,49 @@ async function generateCaptionWithAI({
   };
 }
 
-async function generateEditPromptWithGemini({
-  imageUrl,
+function buildAiEditPrompt({
   preset = "Luxury Interior",
+  customPrompt = "",
   editMode = "background_only",
   preserveProduct = true,
   keepPot = true,
-  language = "english",
-  customPrompt = "",
-  model = GEMINI_TEXT_MODEL,
-  apiKey = GEMINI_API_KEY,
+  aspectRatio = "4:5",
+  outputSize = "1080x1350",
+  resolution = 1080,
+  quality = "high",
+  backgroundIntensity = "medium",
+  userPrompt = "",
 }) {
-  const basePrompt = buildAiEditPrompt({
-    preset,
-    customPrompt,
-    editMode,
-    preserveProduct,
-    keepPot,
-  });
+  const rules = [
+    "The result must be photorealistic and look like real professional photography.",
+    "Keep natural perspective, believable scale, correct shadows, realistic lighting, and harmonious colors.",
+    "No cartoon, no painting, no CGI look, no artificial AI artifacts.",
+    "No text, no watermark.",
+  ];
 
-  const analysisPrompt = `
-Analyze this product image and create a professional AI image editing prompt.
+  if (preserveProduct) {
+    rules.push(
+      "Keep the original tree / plant / flower arrangement exactly unchanged.",
+      "Do NOT change product shape, trunk, branches, leaves, flowers, colors, density, height, width, proportions, angle, or realism.",
+    );
+  }
 
-Language:
-${language}
+  if (keepPot) {
+    rules.push(
+      "Keep the pot / planter / base exactly unchanged unless explicitly asked.",
+      "Do NOT change pot shape, color, material, texture, size, or placement.",
+    );
+  }
+
+  rules.push(
+    `Output aspect ratio: ${aspectRatio}.`,
+    `Target output size: ${outputSize}.`,
+    `Target resolution: ${resolution}.`,
+    `Quality level: ${quality}.`,
+  );
+
+  return `
+Professional AI image edit request.
 
 Preset:
 ${preset}
@@ -1155,49 +1012,27 @@ ${preset}
 Edit mode:
 ${editMode}
 
-Mandatory fixed rules:
-${basePrompt}
+Background intensity:
+${backgroundIntensity}
 
-Return strict JSON only:
-{
-  "prompt": "full detailed edit prompt",
-  "preset": "${preset}",
-  "editMode": "${editMode}",
-  "fixedRules": ["rule 1", "rule 2"]
-}
+User instruction:
+${userPrompt || customPrompt || "Create a premium realistic background that enhances the product."}
+
+Fixed rules:
+${rules.map((rule) => `- ${rule}`).join("\n")}
+
+Return only the edited image.
 `;
-
-  const text = await generateVisionWithGemini({
-    imageUrl,
-    prompt: analysisPrompt,
-    modelName: model,
-    apiKey,
-    fallbackTextOnly: false,
-  });
-
-  const parsed = parseJsonLoose(text);
-
-  return {
-    prompt: parsed?.prompt || String(text).replace(/```json|```/g, "").trim(),
-    preset: parsed?.preset || preset,
-    editMode: parsed?.editMode || editMode,
-    fixedRules:
-      Array.isArray(parsed?.fixedRules) && parsed.fixedRules.length > 0
-        ? parsed.fixedRules
-        : buildFixedAiEditRules({}),
-  };
 }
 
 async function editImageWithGemini({ originalImageUrl, prompt, model = GEMINI_IMAGE_MODEL }) {
-  requireGeminiConfig(GEMINI_API_KEY);
+  requireGeminiConfig();
 
   if (!originalImageUrl || !isPublicHttpsUrl(originalImageUrl)) {
     throw new Error("originalImageUrl must be a public HTTPS URL.");
   }
 
-  if (!prompt) {
-    throw new Error("prompt is required.");
-  }
+  if (!prompt) throw new Error("prompt is required.");
 
   const imagePart = await fetchImageAsInlineData(originalImageUrl);
 
@@ -1225,11 +1060,7 @@ async function editImageWithGemini({ originalImageUrl, prompt, model = GEMINI_IM
 
   if (!imageOutput) {
     const textOutput = parts.map((part) => part.text).filter(Boolean).join("\n");
-
-    throw new Error(
-      textOutput ||
-        "Gemini image model did not return image data. Check image model access.",
-    );
+    throw new Error(textOutput || "Gemini image model did not return image data.");
   }
 
   const inlineData = imageOutput.inlineData || imageOutput.inline_data;
@@ -1366,13 +1197,11 @@ async function publishScheduledPost(post) {
 
     return updatedPost;
   } catch (error) {
-    const errorMessage = JSON.stringify(error.response?.data || error.message);
-
     await supabase
       .from("scheduled_posts")
       .update({
         status: "failed",
-        error_message: errorMessage,
+        error_message: JSON.stringify(error.response?.data || error.details || error.message),
         updated_at: new Date().toISOString(),
       })
       .eq("id", post.id);
@@ -1460,133 +1289,12 @@ async function createScheduledPostFromInput(inputBody) {
   return post;
 }
 
-async function runWithConcurrency(items, concurrency, task) {
-  if (!items || items.length === 0) return;
-
-  let nextIndex = 0;
-  const safeConcurrency = Math.max(1, Math.min(Number(concurrency) || 1, items.length));
-
-  async function worker() {
-    while (true) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      if (currentIndex >= items.length) return;
-      await task(items[currentIndex], currentIndex);
-    }
-  }
-
-  await Promise.all(Array.from({ length: safeConcurrency }, () => worker()));
-}
-
-async function processAiBulkJob(jobId) {
-  requireSupabaseConfig();
-
-  const { data: job, error: jobError } = await supabase
-    .from("ai_jobs")
-    .select("*")
-    .eq("id", jobId)
-    .single();
-
-  if (jobError) {
-    console.error("Could not load AI job:", jobError);
-    return;
-  }
-
-  await supabase.from("ai_jobs").update({ status: "processing" }).eq("id", jobId);
-
-  const { data: items, error: itemsError } = await supabase
-    .from("ai_job_items")
-    .select("*")
-    .eq("ai_job_id", jobId)
-    .order("created_at", { ascending: true });
-
-  if (itemsError) {
-    await supabase
-      .from("ai_jobs")
-      .update({ status: "failed", error_message: itemsError.message })
-      .eq("id", jobId);
-    return;
-  }
-
-  let completed = 0;
-  let failed = 0;
-
-  await runWithConcurrency(items || [], AI_BULK_CONCURRENCY, async (item) => {
-    await supabase.from("ai_job_items").update({ status: "processing" }).eq("id", item.id);
-
-    try {
-      const result = await editImageWithGemini({
-        originalImageUrl: item.original_image_url,
-        prompt: item.prompt,
-        model: job.model || GEMINI_IMAGE_MODEL,
-      });
-
-      const savedMedia = await insertAiGeneratedMedia({
-        editedImageUrl: result.editedImageUrl,
-        sourceMediaAssetId: item.original_media_asset_id,
-        aiJobId: job.id,
-        prompt: item.prompt,
-        editMode: job.edit_mode,
-        provider: job.provider,
-        model: job.model,
-        aspectRatio: job.aspect_ratio,
-        outputSize: job.output_size,
-        resolution: job.resolution,
-        quality: job.quality,
-      });
-
-      await supabase
-        .from("ai_job_items")
-        .update({
-          status: "completed",
-          edited_image_url: result.editedImageUrl,
-          result_media_asset_id: savedMedia?.id || null,
-          error_message: null,
-        })
-        .eq("id", item.id);
-
-      completed += 1;
-    } catch (error) {
-      failed += 1;
-
-      await supabase
-        .from("ai_job_items")
-        .update({
-          status: "failed",
-          error_message: error.response?.data
-            ? JSON.stringify(error.response.data)
-            : error.message,
-        })
-        .eq("id", item.id);
-    }
-
-    await supabase
-      .from("ai_jobs")
-      .update({
-        completed_items: completed,
-        failed_items: failed,
-      })
-      .eq("id", jobId);
-  });
-
-  await supabase
-    .from("ai_jobs")
-    .update({
-      status: failed > 0 && completed === 0 ? "failed" : "completed",
-      completed_items: completed,
-      failed_items: failed,
-    })
-    .eq("id", jobId);
-}
-
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
 
   const signature = req.headers["x-hub-signature-256"];
 
-  if (!signature || !signature.startsWith("sha256=")) {
-    return false;
-  }
+  if (!signature || !signature.startsWith("sha256=")) return false;
 
   const expected = `sha256=${createHmac("sha256", META_APP_SECRET)
     .update(req.rawBody || Buffer.from(""))
@@ -1600,7 +1308,13 @@ function verifyMetaSignature(req) {
   return timingSafeEqual(sigBuffer, expectedBuffer);
 }
 
-async function storeWebhookEvent({ body, field = null, eventType = null, processed = false, errorMessage = null }) {
+async function storeWebhookEvent({
+  body,
+  field = null,
+  eventType = null,
+  processed = false,
+  errorMessage = null,
+}) {
   if (!supabase) return null;
 
   const { data, error } = await supabase
@@ -1623,6 +1337,154 @@ async function storeWebhookEvent({ body, field = null, eventType = null, process
   }
 
   return data;
+}
+
+async function fetchCommentDetails(commentId) {
+  const response = await graphGet(
+    `/${commentId}`,
+    {
+      fields: "id,text,username,timestamp,like_count,parent_id,media,from",
+      access_token: getInstagramToken() || getPageToken(),
+    },
+    { preferInstagram: true },
+  );
+
+  return response.data;
+}
+
+async function upsertCommentFromMeta(value) {
+  requireSupabaseConfig();
+
+  let commentValue = value || {};
+  const igCommentId = commentValue.id || commentValue.comment_id;
+
+  if (!igCommentId) return null;
+
+  let text = commentValue.text || commentValue.message || "";
+
+  if (!text) {
+    try {
+      const details = await fetchCommentDetails(igCommentId);
+      commentValue = { ...details, ...commentValue };
+      text = commentValue.text || commentValue.message || "";
+    } catch (error) {
+      console.warn("Could not fetch comment details:", error.details || error.message);
+    }
+  }
+
+  const mediaObject = commentValue.media || {};
+  const fromObject = commentValue.from || commentValue.user || {};
+
+  const row = {
+    ig_comment_id: igCommentId,
+    ig_media_id:
+      commentValue.media_id ||
+      mediaObject.id ||
+      commentValue.ig_media_id ||
+      null,
+    parent_comment_id:
+      commentValue.parent_id ||
+      commentValue.parent_comment_id ||
+      commentValue.parent?.id ||
+      null,
+    username:
+      fromObject.username ||
+      commentValue.username ||
+      commentValue.user?.username ||
+      null,
+    user_id:
+      fromObject.id ||
+      commentValue.user_id ||
+      commentValue.user?.id ||
+      null,
+    text,
+    like_count: Number(commentValue.like_count || 0),
+    timestamp: commentValue.timestamp
+      ? new Date(commentValue.timestamp).toISOString()
+      : new Date().toISOString(),
+    is_reply: Boolean(commentValue.parent_id || commentValue.parent_comment_id),
+    raw: commentValue,
+  };
+
+  const { data, error } = await supabase
+    .from("ig_comments")
+    .upsert(row, { onConflict: "ig_comment_id" })
+    .select()
+    .single();
+
+  if (error) {
+    console.warn("Comment upsert failed:", error.message);
+    return null;
+  }
+
+  await applyAutoReplyRulesToComment(data);
+  return data;
+}
+
+async function saveMediaCache(media) {
+  requireSupabaseConfig();
+
+  const { data, error } = await supabase
+    .from("ig_media_cache")
+    .upsert(
+      {
+        ig_media_id: media.id,
+        caption: media.caption || null,
+        media_type: media.media_type || null,
+        media_url: media.media_url || null,
+        permalink: media.permalink || null,
+        thumbnail_url: media.thumbnail_url || null,
+        timestamp: media.timestamp || null,
+        comments_count: media.comments_count || 0,
+        raw: media,
+      },
+      { onConflict: "ig_media_id" },
+    )
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  return data;
+}
+
+async function syncCommentsForMedia(igMediaId) {
+  requireSupabaseConfig();
+
+  const token = getInstagramToken() || getPageToken();
+
+  const response = await graphGet(
+    `/${igMediaId}/comments`,
+    {
+      fields:
+        "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}",
+      access_token: token,
+    },
+    { preferInstagram: true },
+  );
+
+  const saved = [];
+
+  for (const comment of response.data?.data || []) {
+    const savedComment = await upsertCommentFromMeta({
+      ...comment,
+      media_id: igMediaId,
+    });
+
+    if (savedComment) saved.push(savedComment);
+
+    for (const reply of comment.replies?.data || []) {
+      const savedReply = await upsertCommentFromMeta({
+        ...reply,
+        media_id: igMediaId,
+        parent_id: comment.id,
+      });
+
+      if (savedReply) saved.push(savedReply);
+    }
+  }
+
+  return saved;
 }
 
 async function upsertConversationFromMessage({ senderId, text, sentAt }) {
@@ -1650,6 +1512,7 @@ async function upsertConversationFromMessage({ senderId, text, sentAt }) {
       .single();
 
     if (error) throw error;
+
     return data;
   }
 
@@ -1668,6 +1531,7 @@ async function upsertConversationFromMessage({ senderId, text, sentAt }) {
     .single();
 
   if (error) throw error;
+
   return data;
 }
 
@@ -1695,355 +1559,31 @@ async function insertInboundMessageFromWebhook(messagingEvent) {
 
   if (!conversation) return;
 
-  if (mid) {
-    const { error } = await supabase.from("ig_messages").upsert(
-      {
-        conversation_id: conversation.id,
-        meta_message_id: mid,
-        ig_scoped_user_id: senderId,
-        direction: "inbound",
-        message_type: messageType,
-        text,
-        media_url: mediaUrl,
-        from_id: senderId,
-        to_id: recipientId,
-        sent_at: timestamp,
-        raw: messagingEvent,
-      },
-      { onConflict: "meta_message_id" },
-    );
-
-    if (error) {
-      console.warn("Inbound message upsert failed:", error.message);
-    }
-  } else {
-    const { error } = await supabase.from("ig_messages").insert({
-      conversation_id: conversation.id,
-      ig_scoped_user_id: senderId,
-      direction: "inbound",
-      message_type: messageType,
-      text,
-      media_url: mediaUrl,
-      from_id: senderId,
-      to_id: recipientId,
-      sent_at: timestamp,
-      raw: messagingEvent,
-    });
-
-    if (error) {
-      console.warn("Inbound message insert failed:", error.message);
-    }
-  }
-}
-
-function autoReplyRuleMatches(rule, commentText) {
-  const text = String(commentText || "").toLowerCase().trim();
-
-  if (!rule.is_enabled) return false;
-
-  if (rule.trigger_type === "any_comment") return true;
-
-  const keywords = Array.isArray(rule.keywords)
-    ? rule.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean)
-    : [];
-
-  if (keywords.length === 0) return false;
-
-  if (rule.trigger_type === "keyword") {
-    return keywords.some((keyword) => text.includes(keyword));
-  }
-
-  if (rule.trigger_type === "exact_match") {
-    return keywords.some((keyword) => text === keyword);
-  }
-
-  return false;
-}
-
-async function sendCommentPublicReply(igCommentId, message) {
-  const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-
-  const response = await graphPostWithFallback(
-    `/${igCommentId}/replies`,
-    null,
-    {
-      message,
-      access_token: token,
-    },
-    { preferMeta: true, timeout: 30000 },
-  );
-
-  return response.data;
-}
-
-async function sendCommentPrivateReply(igCommentId, message) {
-  const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-
-  const response = await graphPostWithFallback(
-    `/${igCommentId}/private_replies`,
-    null,
-    {
-      message,
-      access_token: token,
-    },
-    { preferMeta: true, timeout: 30000 },
-  );
-
-  return response.data;
-}
-
-async function applyAutoReplyRulesToComment(commentRow) {
-  if (!AUTO_REPLY_ENABLED || !commentRow?.ig_comment_id) return;
-
-  requireSupabaseConfig();
-
-  const { data: rules, error } = await supabase
-    .from("ig_auto_reply_rules")
-    .select("*")
-    .eq("is_enabled", true);
-
-  if (error) {
-    console.warn("Could not load auto reply rules:", error.message);
-    return;
-  }
-
-  for (const rule of rules || []) {
-    if (!autoReplyRuleMatches(rule, commentRow.text)) continue;
-
-    if (rule.only_once_per_user && commentRow.user_id) {
-      const { data: existingLog } = await supabase
-        .from("ig_auto_reply_logs")
-        .select("id")
-        .eq("rule_id", rule.id)
-        .eq("user_id", commentRow.user_id)
-        .eq("status", "sent")
-        .maybeSingle();
-
-      if (existingLog) {
-        await supabase.from("ig_auto_reply_logs").insert({
-          rule_id: rule.id,
-          ig_comment_id: commentRow.ig_comment_id,
-          ig_media_id: commentRow.ig_media_id,
-          username: commentRow.username,
-          user_id: commentRow.user_id,
-          reply_mode: rule.reply_mode,
-          status: "skipped",
-          message_text: "Skipped because only_once_per_user is enabled.",
-        });
-        continue;
-      }
-    }
-
-    try {
-      if (
-        (rule.reply_mode === "public_reply" || rule.reply_mode === "both") &&
-        rule.public_reply_text
-      ) {
-        await sendCommentPublicReply(commentRow.ig_comment_id, rule.public_reply_text);
-      }
-
-      if (
-        (rule.reply_mode === "private_reply" || rule.reply_mode === "both") &&
-        rule.private_reply_text
-      ) {
-        await sendCommentPrivateReply(commentRow.ig_comment_id, rule.private_reply_text);
-      }
-
-      await supabase.from("ig_auto_reply_logs").insert({
-        rule_id: rule.id,
-        ig_comment_id: commentRow.ig_comment_id,
-        ig_media_id: commentRow.ig_media_id,
-        username: commentRow.username,
-        user_id: commentRow.user_id,
-        reply_mode: rule.reply_mode,
-        message_text:
-          rule.reply_mode === "public_reply"
-            ? rule.public_reply_text
-            : rule.private_reply_text || rule.public_reply_text,
-        status: "sent",
-      });
-
-      await supabase
-        .from("ig_comments")
-        .update({
-          auto_reply_rule_id: rule.id,
-          replied_by_app: rule.reply_mode === "public_reply" || rule.reply_mode === "both",
-          replied_at:
-            rule.reply_mode === "public_reply" || rule.reply_mode === "both"
-              ? new Date().toISOString()
-              : commentRow.replied_at,
-          private_replied_by_app:
-            rule.reply_mode === "private_reply" || rule.reply_mode === "both",
-          private_replied_at:
-            rule.reply_mode === "private_reply" || rule.reply_mode === "both"
-              ? new Date().toISOString()
-              : commentRow.private_replied_at,
-        })
-        .eq("ig_comment_id", commentRow.ig_comment_id);
-    } catch (replyError) {
-      await supabase.from("ig_auto_reply_logs").insert({
-        rule_id: rule.id,
-        ig_comment_id: commentRow.ig_comment_id,
-        ig_media_id: commentRow.ig_media_id,
-        username: commentRow.username,
-        user_id: commentRow.user_id,
-        reply_mode: rule.reply_mode,
-        message_text:
-          rule.reply_mode === "public_reply"
-            ? rule.public_reply_text
-            : rule.private_reply_text || rule.public_reply_text,
-        status: "failed",
-        error_message: replyError.response?.data
-          ? JSON.stringify(replyError.response.data)
-          : replyError.message,
-      });
-    }
-  }
-}
-
-async function fetchCommentDetails(commentId) {
-  const response = await graphGetWithFallback(
-    `/${commentId}`,
-    {
-      fields: "id,text,username,timestamp,like_count,parent_id,media,from",
-      access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
-    },
-    { preferMeta: true, timeout: 30000 },
-  );
-
-  return response.data;
-}
-
-async function upsertCommentFromMeta(value) {
-  requireSupabaseConfig();
-
-  let commentValue = value || {};
-  let igCommentId = commentValue.id || commentValue.comment_id;
-
-  if (!igCommentId) return null;
-
-  let text = commentValue.text || commentValue.message || "";
-
-  if (!text) {
-    try {
-      const details = await fetchCommentDetails(igCommentId);
-      commentValue = { ...details, ...commentValue };
-      text = commentValue.text || commentValue.message || "";
-    } catch (error) {
-      console.warn("Could not fetch comment details:", error.response?.data || error.message);
-    }
-  }
-
-  const mediaObject = commentValue.media || {};
-  const fromObject = commentValue.from || commentValue.user || {};
-
-  const timestampValue = commentValue.timestamp
-    ? new Date(commentValue.timestamp).toISOString()
-    : new Date().toISOString();
-
-  const row = {
-    ig_comment_id: igCommentId,
-    ig_media_id:
-      commentValue.media_id ||
-      mediaObject.id ||
-      commentValue.ig_media_id ||
-      null,
-    parent_comment_id:
-      commentValue.parent_id ||
-      commentValue.parent_comment_id ||
-      commentValue.parent?.id ||
-      null,
-    username:
-      fromObject.username ||
-      commentValue.username ||
-      commentValue.user?.username ||
-      null,
-    user_id:
-      fromObject.id ||
-      commentValue.user_id ||
-      commentValue.user?.id ||
-      null,
+  const payload = {
+    conversation_id: conversation.id,
+    meta_message_id: mid,
+    ig_scoped_user_id: senderId,
+    direction: "inbound",
+    message_type: messageType,
     text,
-    like_count: Number(commentValue.like_count || 0),
-    timestamp: timestampValue,
-    is_reply: Boolean(commentValue.parent_id || commentValue.parent_comment_id),
-    raw: commentValue,
+    media_url: mediaUrl,
+    from_id: senderId,
+    to_id: recipientId,
+    sent_at: timestamp,
+    raw: messagingEvent,
   };
 
-  const { data, error } = await supabase
-    .from("ig_comments")
-    .upsert(row, { onConflict: "ig_comment_id" })
-    .select()
-    .single();
+  if (mid) {
+    const { error } = await supabase
+      .from("ig_messages")
+      .upsert(payload, { onConflict: "meta_message_id" });
 
-  if (error) {
-    console.warn("Comment upsert failed:", error.message);
-    return null;
+    if (error) console.warn("Inbound message upsert failed:", error.message);
+  } else {
+    const { error } = await supabase.from("ig_messages").insert(payload);
+
+    if (error) console.warn("Inbound message insert failed:", error.message);
   }
-
-  await applyAutoReplyRulesToComment(data);
-  return data;
-}
-
-async function saveMediaCache(media) {
-  const { data, error } = await supabase
-    .from("ig_media_cache")
-    .upsert(
-      {
-        ig_media_id: media.id,
-        caption: media.caption || null,
-        media_type: media.media_type || null,
-        media_url: media.media_url || null,
-        permalink: media.permalink || null,
-        thumbnail_url: media.thumbnail_url || null,
-        timestamp: media.timestamp || null,
-        comments_count: media.comments_count || 0,
-        raw: media,
-      },
-      { onConflict: "ig_media_id" },
-    )
-    .select()
-    .single();
-
-  if (error) throw error;
-  return data;
-}
-
-async function syncCommentsForMedia(igMediaId) {
-  requireSupabaseConfig();
-
-  const response = await graphGetWithFallback(
-    `/${igMediaId}/comments`,
-    {
-      fields:
-        "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}",
-      access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
-    },
-    { preferMeta: true, timeout: 30000 },
-  );
-
-  const saved = [];
-
-  for (const comment of response.data?.data || []) {
-    const savedComment = await upsertCommentFromMeta({
-      ...comment,
-      media_id: igMediaId,
-    });
-
-    if (savedComment) saved.push(savedComment);
-
-    for (const reply of comment.replies?.data || []) {
-      const savedReply = await upsertCommentFromMeta({
-        ...reply,
-        media_id: igMediaId,
-        parent_id: comment.id,
-      });
-
-      if (savedReply) saved.push(savedReply);
-    }
-  }
-
-  return saved;
 }
 
 function extractParticipant(conversation) {
@@ -2059,12 +1599,15 @@ function extractParticipant(conversation) {
     candidates.find((p) => {
       const id = String(p.id || "");
       return id !== String(IG_USER_ID) && id !== String(FACEBOOK_PAGE_ID);
-    }) || candidates[0] || null
+    }) ||
+    candidates[0] ||
+    null
   );
 }
 
 function normalizeMessageDirection(msg) {
   const fromId = String(msg.from?.id || msg.from_id || "");
+
   if (fromId === String(IG_USER_ID) || fromId === String(FACEBOOK_PAGE_ID)) {
     return "outbound";
   }
@@ -2074,6 +1617,7 @@ function normalizeMessageDirection(msg) {
 
 function normalizeMessageAttachment(msg) {
   const attachments = msg.attachments?.data || msg.attachments || [];
+
   if (Array.isArray(attachments) && attachments.length > 0) {
     return attachments[0];
   }
@@ -2085,10 +1629,12 @@ async function upsertConversationRow(conversation) {
   requireSupabaseConfig();
 
   const participant = extractParticipant(conversation);
-  const lastMessage = conversation.messages?.data?.[0] || conversation.messages?.[0] || null;
+  const lastMessage =
+    conversation.messages?.data?.[0] || conversation.messages?.[0] || null;
 
   const metaConversationId = conversation.id;
   const igScopedUserId = participant?.id || conversation.ig_scoped_user_id || null;
+
   const username =
     participant?.username ||
     participant?.name ||
@@ -2118,6 +1664,7 @@ async function upsertConversationRow(conversation) {
     .single();
 
   if (error) throw error;
+
   return data;
 }
 
@@ -2154,6 +1701,7 @@ async function saveConversationMessages(conversationRow, messages) {
       const result = await supabase
         .from("ig_messages")
         .upsert(payload, { onConflict: "meta_message_id" });
+
       error = result.error;
     } else {
       const result = await supabase.from("ig_messages").insert(payload);
@@ -2171,14 +1719,16 @@ async function saveConversationMessages(conversationRow, messages) {
 }
 
 async function fetchMessagesForConversation(conversationId) {
+  const token = getInstagramToken() || getPageToken();
+
   try {
-    const response = await graphGetWithFallback(
+    const response = await graphGet(
       `/${conversationId}/messages`,
       {
         fields: "id,message,from,to,created_time,attachments",
-        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+        access_token: token,
       },
-      { preferMeta: false, timeout: 30000 },
+      { preferInstagram: true },
     );
 
     return response.data?.data || [];
@@ -2188,13 +1738,14 @@ async function fetchMessagesForConversation(conversationId) {
       firstError.details || firstError.response?.data || firstError.message,
     );
 
-    const response = await graphGetWithFallback(
+    const response = await graphGet(
       `/${conversationId}`,
       {
-        fields: "messages.limit(50){id,message,from,to,created_time,attachments},participants,updated_time",
-        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
+        fields:
+          "messages.limit(50){id,message,from,to,created_time,attachments},participants,updated_time",
+        access_token: token,
       },
-      { preferMeta: false, timeout: 30000 },
+      { preferInstagram: true },
     );
 
     return response.data?.messages?.data || [];
@@ -2203,23 +1754,20 @@ async function fetchMessagesForConversation(conversationId) {
 
 async function syncInstagramConversations() {
   requireSupabaseConfig();
-
-  if (!hasInstagramTokenConfig()) {
-    throw new Error("IG_USER_ID and META_ACCESS_TOKEN are required for Instagram sync.");
-  }
+  requireInstagramConfig();
 
   const errors = [];
   let conversationsCount = 0;
   let messagesCount = 0;
 
-  const response = await graphGetWithFallback(
+  const response = await graphGet(
     `/${IG_USER_ID}/conversations`,
     {
       fields:
         "id,participants,updated_time,messages.limit(1){id,message,from,to,created_time,attachments}",
-      access_token: META_ACCESS_TOKEN,
+      access_token: getInstagramToken(),
     },
-    { preferMeta: false, timeout: 30000 },
+    { preferInstagram: true },
   );
 
   const conversations = response.data?.data || [];
@@ -2274,7 +1822,7 @@ async function syncPageConversations() {
       platform: "instagram",
       fields:
         "id,updated_time,participants,messages.limit(1){id,message,from,to,created_time,attachments}",
-      access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+      access_token: getPageToken(),
     },
     timeout: 30000,
   });
@@ -2292,7 +1840,7 @@ async function syncPageConversations() {
           {
             params: {
               fields: "id,message,from,to,created_time,attachments",
-              access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+              access_token: getPageToken(),
             },
             timeout: 30000,
           },
@@ -2325,6 +1873,149 @@ async function syncPageConversations() {
   };
 }
 
+function autoReplyRuleMatches(rule, commentText) {
+  const text = String(commentText || "").toLowerCase().trim();
+
+  if (!rule.is_enabled) return false;
+  if (rule.trigger_type === "any_comment") return true;
+
+  const keywords = Array.isArray(rule.keywords)
+    ? rule.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean)
+    : [];
+
+  if (keywords.length === 0) return false;
+
+  if (rule.trigger_type === "keyword") {
+    return keywords.some((keyword) => text.includes(keyword));
+  }
+
+  if (rule.trigger_type === "exact_match") {
+    return keywords.some((keyword) => text === keyword);
+  }
+
+  return false;
+}
+
+async function sendCommentPublicReply(igCommentId, message) {
+  const response = await graphPost(
+    `/${igCommentId}/replies`,
+    null,
+    {
+      message,
+      access_token: getInstagramToken() || getPageToken(),
+    },
+    { preferInstagram: true },
+  );
+
+  return response.data;
+}
+
+async function sendCommentPrivateReply(igCommentId, message) {
+  const response = await graphPost(
+    `/${igCommentId}/private_replies`,
+    null,
+    {
+      message,
+      access_token: getInstagramToken() || getPageToken(),
+    },
+    { preferInstagram: true },
+  );
+
+  return response.data;
+}
+
+async function applyAutoReplyRulesToComment(commentRow) {
+  if (!AUTO_REPLY_ENABLED || !commentRow?.ig_comment_id) return;
+
+  requireSupabaseConfig();
+
+  const { data: rules, error } = await supabase
+    .from("ig_auto_reply_rules")
+    .select("*")
+    .eq("is_enabled", true);
+
+  if (error) {
+    console.warn("Could not load auto reply rules:", error.message);
+    return;
+  }
+
+  for (const rule of rules || []) {
+    if (!autoReplyRuleMatches(rule, commentRow.text)) continue;
+
+    if (rule.only_once_per_user && commentRow.user_id) {
+      const { data: existingLog } = await supabase
+        .from("ig_auto_reply_logs")
+        .select("id")
+        .eq("rule_id", rule.id)
+        .eq("user_id", commentRow.user_id)
+        .eq("status", "sent")
+        .maybeSingle();
+
+      if (existingLog) {
+        await supabase.from("ig_auto_reply_logs").insert({
+          rule_id: rule.id,
+          ig_comment_id: commentRow.ig_comment_id,
+          ig_media_id: commentRow.ig_media_id,
+          username: commentRow.username,
+          user_id: commentRow.user_id,
+          reply_mode: rule.reply_mode,
+          status: "skipped",
+          message_text: "Skipped because only_once_per_user is enabled.",
+        });
+
+        continue;
+      }
+    }
+
+    try {
+      if (
+        (rule.reply_mode === "public_reply" || rule.reply_mode === "both") &&
+        rule.public_reply_text
+      ) {
+        await sendCommentPublicReply(commentRow.ig_comment_id, rule.public_reply_text);
+      }
+
+      if (
+        (rule.reply_mode === "private_reply" || rule.reply_mode === "both") &&
+        rule.private_reply_text
+      ) {
+        await sendCommentPrivateReply(commentRow.ig_comment_id, rule.private_reply_text);
+      }
+
+      await supabase.from("ig_auto_reply_logs").insert({
+        rule_id: rule.id,
+        ig_comment_id: commentRow.ig_comment_id,
+        ig_media_id: commentRow.ig_media_id,
+        username: commentRow.username,
+        user_id: commentRow.user_id,
+        reply_mode: rule.reply_mode,
+        message_text:
+          rule.reply_mode === "public_reply"
+            ? rule.public_reply_text
+            : rule.private_reply_text || rule.public_reply_text,
+        status: "sent",
+      });
+    } catch (replyError) {
+      await supabase.from("ig_auto_reply_logs").insert({
+        rule_id: rule.id,
+        ig_comment_id: commentRow.ig_comment_id,
+        ig_media_id: commentRow.ig_media_id,
+        username: commentRow.username,
+        user_id: commentRow.user_id,
+        reply_mode: rule.reply_mode,
+        message_text:
+          rule.reply_mode === "public_reply"
+            ? rule.public_reply_text
+            : rule.private_reply_text || rule.public_reply_text,
+        status: "failed",
+        error_message: replyError.response?.data
+          ? JSON.stringify(replyError.response.data)
+          : replyError.message,
+      });
+    }
+  }
+}
+
 /**
  * ROOT / HEALTH
  */
@@ -2335,8 +2026,12 @@ app.get("/", (_req, res) => {
     status: "running",
     graphVersion: GRAPH_VERSION,
     instagramTokenConfigured: hasInstagramTokenConfig(),
+    instagramTokenPrefix: getInstagramToken()
+      ? `${getInstagramToken().slice(0, 4)}...`
+      : null,
     igUserIdConfigured: Boolean(IG_USER_ID),
     pageTokenConfigured: hasPageTokenConfig(),
+    pageTokenPrefix: getPageToken() ? `${getPageToken().slice(0, 4)}...` : null,
     supabaseConfigured: Boolean(supabase),
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET,
@@ -2345,7 +2040,7 @@ app.get("/", (_req, res) => {
     instagramLoginMode: hasInstagramTokenConfig(),
     inboxEnabled: hasInstagramTokenConfig() || hasPageTokenConfig(),
     pageMessagingEnabled: hasPageTokenConfig(),
-    commentsEnabled: Boolean((META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN) && IG_USER_ID),
+    commentsEnabled: Boolean((getInstagramToken() || getPageToken()) && IG_USER_ID),
     webhooksEnabled: Boolean(META_WEBHOOK_VERIFY_TOKEN),
   });
 });
@@ -2356,8 +2051,12 @@ app.get("/api/health", (_req, res) => {
     timestamp: new Date().toISOString(),
     graphVersion: GRAPH_VERSION,
     instagramTokenConfigured: hasInstagramTokenConfig(),
+    instagramTokenPrefix: getInstagramToken()
+      ? `${getInstagramToken().slice(0, 4)}...`
+      : null,
     igUserIdConfigured: Boolean(IG_USER_ID),
     pageTokenConfigured: hasPageTokenConfig(),
+    pageTokenPrefix: getPageToken() ? `${getPageToken().slice(0, 4)}...` : null,
     supabaseConfigured: Boolean(supabase),
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET,
@@ -2366,7 +2065,7 @@ app.get("/api/health", (_req, res) => {
     instagramLoginMode: hasInstagramTokenConfig(),
     inboxEnabled: hasInstagramTokenConfig() || hasPageTokenConfig(),
     pageMessagingEnabled: hasPageTokenConfig(),
-    commentsEnabled: Boolean((META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN) && IG_USER_ID),
+    commentsEnabled: Boolean((getInstagramToken() || getPageToken()) && IG_USER_ID),
     webhooksEnabled: Boolean(META_WEBHOOK_VERIFY_TOKEN),
   });
 });
@@ -2396,6 +2095,7 @@ app.post("/api/webhooks/meta", async (req, res) => {
     }
 
     const body = req.body;
+
     const event = await storeWebhookEvent({
       body,
       field: null,
@@ -2409,11 +2109,6 @@ app.post("/api/webhooks/meta", async (req, res) => {
       }
 
       for (const change of entry.changes || []) {
-        console.log("Webhook change:", {
-          field: change.field,
-          value: change.value,
-        });
-
         await storeWebhookEvent({
           body: change,
           field: change.field,
@@ -2423,11 +2118,11 @@ app.post("/api/webhooks/meta", async (req, res) => {
 
         const field = String(change.field || "").toLowerCase();
 
-        if (field.includes("comment") || field.includes("comments")) {
+        if (field.includes("comment")) {
           await upsertCommentFromMeta(change.value || {});
         }
 
-        if (field.includes("message") || field.includes("messages")) {
+        if (field.includes("message")) {
           await storeWebhookEvent({
             body: change,
             field: change.field,
@@ -2447,7 +2142,7 @@ app.post("/api/webhooks/meta", async (req, res) => {
 
     return res.json({ ok: true });
   } catch (error) {
-    console.error("Webhook processing failed:", error.response?.data || error.message);
+    console.error("Webhook processing failed:", error.response?.data || error.details || error.message);
 
     await storeWebhookEvent({
       body: req.body,
@@ -2456,12 +2151,12 @@ app.post("/api/webhooks/meta", async (req, res) => {
       processed: false,
       errorMessage: error.response?.data
         ? JSON.stringify(error.response.data)
-        : error.message,
+        : JSON.stringify(error.details || error.message),
     });
 
     return res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message,
+      error: error.response?.data || error.details || error.message,
     });
   }
 });
@@ -2469,6 +2164,22 @@ app.post("/api/webhooks/meta", async (req, res) => {
 /**
  * DEBUG
  */
+app.get("/api/debug/token-status", (_req, res) => {
+  const instagramToken = getInstagramToken();
+  const pageToken = getPageToken();
+
+  res.json({
+    ok: true,
+    instagramTokenConfigured: Boolean(instagramToken),
+    instagramTokenPrefix: instagramToken ? `${instagramToken.slice(0, 6)}...` : null,
+    instagramTokenLooksLikeInstagram: isLikelyInstagramToken(instagramToken),
+    instagramTokenLooksLikeFacebook: isLikelyFacebookToken(instagramToken),
+    pageTokenConfigured: Boolean(pageToken),
+    pageTokenPrefix: pageToken ? `${pageToken.slice(0, 6)}...` : null,
+    pageTokenLooksLikeFacebook: isLikelyFacebookToken(pageToken),
+  });
+});
+
 app.get("/api/debug/webhook-events", async (_req, res) => {
   try {
     requireSupabaseConfig();
@@ -2481,10 +2192,7 @@ app.get("/api/debug/webhook-events", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      events: data || [],
-    });
+    res.json({ ok: true, events: data || [] });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -2508,11 +2216,7 @@ app.get("/api/debug/comments", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      count,
-      comments: data || [],
-    });
+    res.json({ ok: true, count, comments: data || [] });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -2556,30 +2260,26 @@ app.get("/api/debug/inbox", async (_req, res) => {
 /**
  * META TEST
  */
-async function testMetaConnection() {
-  requireMetaPublishConfig();
-
-  const response = await graphGetWithFallback(
-    "/me",
-    {
-      fields: "user_id,username",
-      access_token: META_ACCESS_TOKEN,
-    },
-    { preferMeta: false },
-  );
-
-  return {
-    account: response.data,
-    configuredIgUserId: IG_USER_ID,
-    idMatches: String(response.data.user_id) === String(IG_USER_ID),
-    graphVersion: GRAPH_VERSION,
-  };
-}
-
 app.get("/api/meta/test-connection", async (_req, res) => {
   try {
-    const result = await testMetaConnection();
-    res.json({ ok: true, ...result });
+    requireInstagramConfig();
+
+    const response = await graphGet(
+      "/me",
+      {
+        fields: "user_id,username",
+        access_token: getInstagramToken(),
+      },
+      { preferInstagram: true },
+    );
+
+    res.json({
+      ok: true,
+      account: response.data,
+      configuredIgUserId: IG_USER_ID,
+      idMatches: String(response.data.user_id) === String(IG_USER_ID),
+      graphVersion: GRAPH_VERSION,
+    });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -2588,16 +2288,9 @@ app.get("/api/meta/test-connection", async (_req, res) => {
   }
 });
 
-app.post("/api/meta/test-connection", async (_req, res) => {
-  try {
-    const result = await testMetaConnection();
-    res.json({ ok: true, ...result });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
+app.post("/api/meta/test-connection", async (req, res) => {
+  req.url = "/api/meta/test-connection";
+  app.handle(req, res);
 });
 
 /**
@@ -2701,7 +2394,10 @@ app.delete("/api/media/:id", async (req, res) => {
   try {
     requireSupabaseConfig();
 
-    const { error } = await supabase.from("media_assets").delete().eq("id", req.params.id);
+    const { error } = await supabase
+      .from("media_assets")
+      .delete()
+      .eq("id", req.params.id);
 
     if (error) throw error;
 
@@ -2712,7 +2408,7 @@ app.delete("/api/media/:id", async (req, res) => {
 });
 
 /**
- * PUBLISH NOW
+ * PUBLISH
  */
 app.post("/api/meta/publish-now", async (req, res) => {
   try {
@@ -2759,8 +2455,6 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
     }
 
     const result = await generateCaptionWithAI({
-      provider: req.body.provider || "gemini",
-      apiKey: req.body.apiKey,
       imageUrl,
       language: req.body.language || "arabic",
       tone: req.body.tone || "premium",
@@ -2808,47 +2502,8 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
 });
 
 /**
- * AI STUDIO
+ * AI IMAGE EDIT
  */
-app.post("/api/ai/generate-edit-prompt", async (req, res) => {
-  try {
-    const imageUrl =
-      getBodyValue(req.body, "imageUrl", "image_url") ||
-      getBodyValue(req.body, "mediaUrl", "media_url");
-
-    if (!imageUrl) {
-      return res.status(400).json({
-        ok: false,
-        error: "imageUrl or mediaUrl is required.",
-      });
-    }
-
-    const result = await generateEditPromptWithGemini({
-      imageUrl,
-      preset: req.body.preset || "Luxury Interior",
-      editMode: req.body.editMode || req.body.edit_mode || "background_only",
-      preserveProduct: req.body.preserveProduct !== false,
-      keepPot: req.body.keepPot !== false,
-      language: req.body.language || "english",
-      customPrompt: req.body.customPrompt || req.body.custom_prompt || "",
-      model: req.body.model || GEMINI_TEXT_MODEL,
-      apiKey: GEMINI_API_KEY,
-    });
-
-    res.json({ ok: true, result });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
-  req.url = "/api/ai/generate-edit-prompt";
-  app.handle(req, res);
-});
-
 app.post("/api/ai/edit-image", async (req, res) => {
   try {
     requireSupabaseConfig();
@@ -2870,1327 +2525,4 @@ app.post("/api/ai/edit-image", async (req, res) => {
     const editMode = req.body.editMode || req.body.edit_mode || "background_only";
     const aspectRatio = req.body.aspectRatio || req.body.aspect_ratio || "4:5";
     const outputSize = req.body.outputSize || req.body.output_size || "1080x1350";
-    const resolution = Number(req.body.resolution || 1080);
-    const quality = req.body.quality || "high";
-    const backgroundIntensity =
-      req.body.backgroundIntensity || req.body.background_intensity || "medium";
-    const saveToLibrary = req.body.saveToLibrary !== false;
-    const userPrompt = req.body.prompt || req.body.ai_edit_prompt || "";
-
-    if (!userPrompt) {
-      return res.status(400).json({ ok: false, error: "prompt is required." });
-    }
-
-    const finalPrompt = buildAiEditPrompt({
-      preset: req.body.preset || "Custom",
-      customPrompt: req.body.customPrompt || "",
-      editMode,
-      preserveProduct: req.body.preserveProduct !== false,
-      keepPot: req.body.keepPot !== false,
-      aspectRatio,
-      outputSize,
-      resolution,
-      quality,
-      backgroundIntensity,
-      userPrompt,
-    });
-
-    const { data: job, error: jobError } = await supabase
-      .from("ai_jobs")
-      .insert({
-        job_type: "single_edit",
-        status: "processing",
-        total_items: 1,
-        completed_items: 0,
-        failed_items: 0,
-        provider: "gemini",
-        model,
-        edit_mode: editMode,
-        aspect_ratio: aspectRatio,
-        output_size: outputSize,
-        resolution,
-        quality,
-      })
-      .select()
-      .single();
-
-    if (jobError) throw jobError;
-
-    const { data: jobItem, error: itemError } = await supabase
-      .from("ai_job_items")
-      .insert({
-        ai_job_id: job.id,
-        original_media_asset_id: isValidUuid(mediaAssetId) ? mediaAssetId : null,
-        original_image_url: originalImageUrl,
-        prompt: finalPrompt,
-        status: "processing",
-      })
-      .select()
-      .single();
-
-    if (itemError) throw itemError;
-
-    try {
-      const result = await editImageWithGemini({
-        originalImageUrl,
-        prompt: finalPrompt,
-        model,
-      });
-
-      let savedMedia = null;
-
-      if (saveToLibrary) {
-        savedMedia = await insertAiGeneratedMedia({
-          editedImageUrl: result.editedImageUrl,
-          sourceMediaAssetId: mediaAssetId,
-          aiJobId: job.id,
-          prompt: finalPrompt,
-          editMode,
-          provider: "gemini",
-          model,
-          aspectRatio,
-          outputSize,
-          resolution,
-          quality,
-        });
-      }
-
-      await supabase
-        .from("ai_job_items")
-        .update({
-          status: "completed",
-          edited_image_url: result.editedImageUrl,
-          result_media_asset_id: savedMedia?.id || null,
-        })
-        .eq("id", jobItem.id);
-
-      await supabase
-        .from("ai_jobs")
-        .update({
-          status: "completed",
-          completed_items: 1,
-          failed_items: 0,
-        })
-        .eq("id", job.id);
-
-      return res.json({
-        ok: true,
-        result: {
-          jobId: job.id,
-          originalMediaAssetId: mediaAssetId,
-          editedImageUrl: result.editedImageUrl,
-          prompt: finalPrompt,
-          status: "completed",
-          savedMediaAssetId: savedMedia?.id || null,
-          media: savedMedia ? withAliases(savedMedia) : null,
-        },
-      });
-    } catch (error) {
-      await supabase
-        .from("ai_job_items")
-        .update({
-          status: "failed",
-          error_message: error.response?.data
-            ? JSON.stringify(error.response.data)
-            : error.message,
-        })
-        .eq("id", jobItem.id);
-
-      await supabase
-        .from("ai_jobs")
-        .update({
-          status: "failed",
-          failed_items: 1,
-          error_message: error.response?.data
-            ? JSON.stringify(error.response.data)
-            : error.message,
-        })
-        .eq("id", job.id);
-
-      throw error;
-    }
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/ai/bulk-edit", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const items = Array.isArray(req.body.items) ? req.body.items : [];
-    const commonOptions = req.body.commonOptions || req.body.common_options || {};
-
-    if (items.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "items must be a non-empty array.",
-      });
-    }
-
-    const model = commonOptions.model || req.body.model || GEMINI_IMAGE_MODEL;
-    const editMode = commonOptions.editMode || commonOptions.edit_mode || "background_only";
-    const aspectRatio = commonOptions.aspectRatio || commonOptions.aspect_ratio || "4:5";
-    const outputSize = commonOptions.outputSize || commonOptions.output_size || "1080x1350";
-    const resolution = Number(commonOptions.resolution || 1080);
-    const quality = commonOptions.quality || "high";
-
-    const { data: job, error: jobError } = await supabase
-      .from("ai_jobs")
-      .insert({
-        job_type: "bulk_edit",
-        status: "pending",
-        total_items: items.length,
-        completed_items: 0,
-        failed_items: 0,
-        provider: "gemini",
-        model,
-        edit_mode: editMode,
-        aspect_ratio: aspectRatio,
-        output_size: outputSize,
-        resolution,
-        quality,
-      })
-      .select()
-      .single();
-
-    if (jobError) throw jobError;
-
-    const jobItemsPayload = items.map((item) => {
-      const originalImageUrl =
-        item.originalImageUrl ||
-        item.original_image_url ||
-        item.imageUrl ||
-        item.image_url ||
-        item.mediaUrl ||
-        item.media_url;
-
-      const mediaAssetId = item.mediaAssetId || item.media_asset_id || null;
-      const rawPrompt = item.prompt || commonOptions.prompt || "";
-
-      const finalPrompt = buildAiEditPrompt({
-        preset: item.preset || commonOptions.preset || "Custom",
-        customPrompt: item.customPrompt || commonOptions.customPrompt || "",
-        editMode,
-        preserveProduct: item.preserveProduct !== false,
-        keepPot: item.keepPot !== false,
-        aspectRatio,
-        outputSize,
-        resolution,
-        quality,
-        backgroundIntensity:
-          item.backgroundIntensity || commonOptions.backgroundIntensity || "medium",
-        userPrompt: rawPrompt,
-      });
-
-      return {
-        ai_job_id: job.id,
-        original_media_asset_id: isValidUuid(mediaAssetId) ? mediaAssetId : null,
-        original_image_url: originalImageUrl,
-        prompt: finalPrompt,
-        status: "pending",
-      };
-    });
-
-    const invalid = jobItemsPayload.find((item) => !item.original_image_url);
-
-    if (invalid) {
-      return res.status(400).json({
-        ok: false,
-        error: "Every item must include originalImageUrl, imageUrl, or mediaUrl.",
-      });
-    }
-
-    const { error: itemsError } = await supabase
-      .from("ai_job_items")
-      .insert(jobItemsPayload);
-
-    if (itemsError) throw itemsError;
-
-    setImmediate(() => {
-      processAiBulkJob(job.id).catch((error) => {
-        console.error("Background AI bulk job failed:", error.message);
-      });
-    });
-
-    res.json({
-      ok: true,
-      job: {
-        id: job.id,
-        status: "processing",
-        totalItems: items.length,
-        total_items: items.length,
-      },
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message,
-    });
-  }
-});
-
-app.get("/api/ai/jobs", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data, error } = await supabase
-      .from("ai_jobs")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) throw error;
-
-    res.json({ ok: true, jobs: data || [] });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.get("/api/ai/jobs/:id", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data: job, error: jobError } = await supabase
-      .from("ai_jobs")
-      .select("*")
-      .eq("id", req.params.id)
-      .single();
-
-    if (jobError) throw jobError;
-
-    const { data: items, error: itemsError } = await supabase
-      .from("ai_job_items")
-      .select("*")
-      .eq("ai_job_id", req.params.id)
-      .order("created_at", { ascending: true });
-
-    if (itemsError) throw itemsError;
-
-    res.json({ ok: true, job, items: items || [] });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.get("/api/ai/results", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data, error } = await supabase
-      .from("media_assets")
-      .select("*")
-      .eq("is_ai_generated", true)
-      .order("created_at", { ascending: false });
-
-    if (error) throw error;
-
-    res.json({ ok: true, results: (data || []).map(withAliases) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/ai/save-result", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const editedImageUrl =
-      req.body.editedImageUrl ||
-      req.body.edited_image_url ||
-      req.body.imageUrl ||
-      req.body.image_url ||
-      req.body.mediaUrl ||
-      req.body.media_url;
-
-    if (!editedImageUrl || !isPublicHttpsUrl(editedImageUrl)) {
-      return res.status(400).json({
-        ok: false,
-        error: "editedImageUrl must be a public HTTPS URL.",
-      });
-    }
-
-    const media = await insertAiGeneratedMedia({
-      editedImageUrl,
-      sourceMediaAssetId:
-        req.body.sourceMediaAssetId || req.body.source_media_asset_id || null,
-      aiJobId: req.body.aiJobId || req.body.ai_job_id || null,
-      prompt: req.body.prompt || "",
-      editMode: req.body.editMode || req.body.edit_mode || null,
-      provider: req.body.provider || null,
-      model: req.body.model || null,
-      aspectRatio: req.body.aspectRatio || req.body.aspect_ratio || null,
-      outputSize: req.body.outputSize || req.body.output_size || null,
-      resolution: req.body.resolution || null,
-      quality: req.body.quality || null,
-    });
-
-    res.json({ ok: true, media: withAliases(media) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
-  }
-});
-
-app.delete("/api/ai/results/:id", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { error } = await supabase
-      .from("media_assets")
-      .delete()
-      .eq("id", req.params.id)
-      .eq("is_ai_generated", true);
-
-    if (error) throw error;
-
-    res.json({ ok: true, deleted: true });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-/**
- * INBOX / CHATS
- */
-app.get("/api/inbox/conversations", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    let query = supabase
-      .from("ig_conversations")
-      .select("*")
-      .order("last_message_at", { ascending: false, nullsFirst: false });
-
-    if (req.query.status) {
-      query = query.eq("status", req.query.status);
-    }
-
-    if (req.query.search) {
-      const search = `%${req.query.search}%`;
-      query = query.or(`username.ilike.${search},last_message_text.ilike.${search}`);
-    }
-
-    const { data, error } = await query;
-
-    if (error) throw error;
-
-    res.json({ ok: true, conversations: (data || []).map(withAliases) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/inbox/sync-instagram", async (_req, res) => {
-  try {
-    const result = await syncInstagramConversations();
-
-    res.json({
-      ok: true,
-      ...result,
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      requiresPageToken: true,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/inbox/sync-conversations", async (_req, res) => {
-  const errors = [];
-
-  try {
-    const instagramResult = await syncInstagramConversations();
-
-    return res.json({
-      ok: true,
-      mode: "instagram",
-      ...instagramResult,
-    });
-  } catch (instagramError) {
-    errors.push({
-      mode: "instagram",
-      error:
-        instagramError.details ||
-        instagramError.response?.data ||
-        instagramError.message,
-    });
-  }
-
-  if (hasPageTokenConfig()) {
-    try {
-      const pageResult = await syncPageConversations();
-
-      return res.json({
-        ok: true,
-        mode: "page",
-        ...pageResult,
-        previousErrors: errors,
-      });
-    } catch (pageError) {
-      errors.push({
-        mode: "page",
-        error: pageError.response?.data || pageError.message,
-      });
-    }
-  }
-
-  return res.status(500).json({
-    ok: false,
-    errors,
-  });
-});
-
-app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data: conversation, error: convError } = await supabase
-      .from("ig_conversations")
-      .select("*")
-      .eq("id", req.params.id)
-      .single();
-
-    if (convError) throw convError;
-
-    if (req.query.sync === "true" && conversation.meta_conversation_id) {
-      try {
-        const messages = await fetchMessagesForConversation(conversation.meta_conversation_id);
-        await saveConversationMessages(conversation, messages);
-      } catch (syncError) {
-        console.warn(
-          "Message sync on open failed:",
-          syncError.details || syncError.response?.data || syncError.message,
-        );
-      }
-    }
-
-    const { data, error } = await supabase
-      .from("ig_messages")
-      .select("*")
-      .eq("conversation_id", req.params.id)
-      .order("sent_at", { ascending: true });
-
-    if (error) throw error;
-
-    res.json({
-      ok: true,
-      conversation: withAliases(conversation),
-      messages: (data || []).map(withAliases),
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/inbox/send-text", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { conversationId, recipientId, text } = req.body;
-
-    if (!recipientId || !text) {
-      return res.status(400).json({
-        ok: false,
-        error: "recipientId and text are required.",
-      });
-    }
-
-    let response = null;
-    let mode = null;
-
-    if (hasPageTokenConfig()) {
-      response = await axios.post(
-        metaGraphUrl(`/${FACEBOOK_PAGE_ID}/messages`),
-        {
-          recipient: { id: recipientId },
-          messaging_type: "RESPONSE",
-          message: { text },
-        },
-        {
-          params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
-          timeout: 30000,
-        },
-      );
-
-      mode = "page";
-    } else if (hasInstagramTokenConfig()) {
-      response = await graphPostWithFallback(
-        `/${IG_USER_ID}/messages`,
-        {
-          recipient: { id: recipientId },
-          message: { text },
-        },
-        {
-          access_token: META_ACCESS_TOKEN,
-        },
-        { preferMeta: false, timeout: 30000 },
-      );
-
-      mode = "instagram";
-    } else {
-      return res.status(400).json({
-        ok: false,
-        error: "No messaging token configured.",
-      });
-    }
-
-    if (conversationId && isValidUuid(conversationId)) {
-      await supabase.from("ig_messages").insert({
-        conversation_id: conversationId,
-        meta_message_id: response.data?.message_id || null,
-        ig_scoped_user_id: recipientId,
-        direction: "outbound",
-        message_type: "text",
-        text,
-        from_id: mode === "page" ? FACEBOOK_PAGE_ID : IG_USER_ID,
-        to_id: recipientId,
-        sent_at: new Date().toISOString(),
-        raw: response.data,
-      });
-
-      await supabase
-        .from("ig_conversations")
-        .update({
-          last_message_text: text,
-          last_message_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", conversationId);
-    }
-
-    res.json({ ok: true, mode, result: response.data });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/inbox/send-image", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { conversationId, recipientId, imageUrl } = req.body;
-
-    if (!recipientId || !imageUrl) {
-      return res.status(400).json({
-        ok: false,
-        error: "recipientId and imageUrl are required.",
-      });
-    }
-
-    let response = null;
-    let mode = null;
-
-    const messagePayload = {
-      recipient: { id: recipientId },
-      message: {
-        attachment: {
-          type: "image",
-          payload: {
-            url: imageUrl,
-            is_reusable: true,
-          },
-        },
-      },
-    };
-
-    if (hasPageTokenConfig()) {
-      response = await axios.post(
-        metaGraphUrl(`/${FACEBOOK_PAGE_ID}/messages`),
-        {
-          ...messagePayload,
-          messaging_type: "RESPONSE",
-        },
-        {
-          params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
-          timeout: 30000,
-        },
-      );
-
-      mode = "page";
-    } else if (hasInstagramTokenConfig()) {
-      response = await graphPostWithFallback(
-        `/${IG_USER_ID}/messages`,
-        messagePayload,
-        {
-          access_token: META_ACCESS_TOKEN,
-        },
-        { preferMeta: false, timeout: 30000 },
-      );
-
-      mode = "instagram";
-    } else {
-      return res.status(400).json({
-        ok: false,
-        error: "No messaging token configured.",
-      });
-    }
-
-    if (conversationId && isValidUuid(conversationId)) {
-      await supabase.from("ig_messages").insert({
-        conversation_id: conversationId,
-        meta_message_id: response.data?.message_id || null,
-        ig_scoped_user_id: recipientId,
-        direction: "outbound",
-        message_type: "image",
-        media_url: imageUrl,
-        from_id: mode === "page" ? FACEBOOK_PAGE_ID : IG_USER_ID,
-        to_id: recipientId,
-        sent_at: new Date().toISOString(),
-        raw: response.data,
-      });
-
-      await supabase
-        .from("ig_conversations")
-        .update({
-          last_message_text: "[image]",
-          last_message_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", conversationId);
-    }
-
-    res.json({ ok: true, mode, result: response.data });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-/**
- * COMMENTS
- */
-app.post("/api/comments/sync-media", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    if (!IG_USER_ID || !(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN)) {
-      return res.status(400).json({
-        ok: false,
-        error: "IG_USER_ID and access token are required.",
-      });
-    }
-
-    const response = await graphGetWithFallback(
-      `/${IG_USER_ID}/media`,
-      {
-        fields:
-          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
-        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
-      },
-      { preferMeta: true, timeout: 30000 },
-    );
-
-    const saved = [];
-
-    for (const media of response.data?.data || []) {
-      try {
-        const row = await saveMediaCache(media);
-        saved.push(row);
-      } catch (error) {
-        console.warn("Media cache save failed:", error.message);
-      }
-    }
-
-    res.json({ ok: true, media: saved });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/comments/sync-all", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    if (!IG_USER_ID || !(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN)) {
-      return res.status(400).json({
-        ok: false,
-        error: "IG_USER_ID and access token are required.",
-      });
-    }
-
-    const errors = [];
-    let mediaCount = 0;
-    let commentsCount = 0;
-
-    const mediaResponse = await graphGetWithFallback(
-      `/${IG_USER_ID}/media`,
-      {
-        fields:
-          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
-        access_token: META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN,
-      },
-      { preferMeta: true, timeout: 30000 },
-    );
-
-    const mediaItems = mediaResponse.data?.data || [];
-
-    for (const media of mediaItems) {
-      try {
-        await saveMediaCache(media);
-        mediaCount += 1;
-      } catch (error) {
-        errors.push({
-          stage: "media_cache",
-          mediaId: media.id,
-          error: error.response?.data || error.message,
-        });
-      }
-
-      try {
-        const savedComments = await syncCommentsForMedia(media.id);
-        commentsCount += savedComments.length;
-      } catch (error) {
-        errors.push({
-          stage: "comments",
-          mediaId: media.id,
-          error: error.details || error.response?.data || error.message,
-        });
-      }
-    }
-
-    res.json({
-      ok: true,
-      mediaCount,
-      commentsCount,
-      errors,
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.get("/api/comments/media", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data, error } = await supabase
-      .from("ig_media_cache")
-      .select("*")
-      .order("timestamp", { ascending: false });
-
-    if (error) throw error;
-
-    res.json({ ok: true, media: data || [] });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/comments/sync", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const igMediaId = req.body.igMediaId || req.body.ig_media_id;
-
-    if (!igMediaId) {
-      return res.status(400).json({ ok: false, error: "igMediaId is required." });
-    }
-
-    const saved = await syncCommentsForMedia(igMediaId);
-
-    res.json({ ok: true, comments: saved });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.get("/api/comments", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    let query = supabase
-      .from("ig_comments")
-      .select("*")
-      .order("timestamp", { ascending: false });
-
-    if (req.query.igMediaId) {
-      query = query.eq("ig_media_id", req.query.igMediaId);
-    }
-
-    if (req.query.unreplied === "true") {
-      query = query.eq("replied_by_app", false).eq("private_replied_by_app", false);
-    }
-
-    if (req.query.search) {
-      const search = `%${req.query.search}%`;
-      query = query.or(`username.ilike.${search},text.ilike.${search}`);
-    }
-
-    if (req.query.limit) {
-      query = query.limit(Number(req.query.limit));
-    }
-
-    const { data, error } = await query;
-
-    if (error) throw error;
-
-    res.json({ ok: true, comments: data || [] });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/comments/:commentId/reply", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const message = req.body.message;
-
-    if (!message) {
-      return res.status(400).json({ ok: false, error: "message is required." });
-    }
-
-    const result = await sendCommentPublicReply(req.params.commentId, message);
-
-    await supabase
-      .from("ig_comments")
-      .update({
-        replied_by_app: true,
-        replied_at: new Date().toISOString(),
-      })
-      .eq("ig_comment_id", req.params.commentId);
-
-    res.json({ ok: true, result });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/comments/:commentId/private-reply", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const message = req.body.message;
-
-    if (!message) {
-      return res.status(400).json({ ok: false, error: "message is required." });
-    }
-
-    const result = await sendCommentPrivateReply(req.params.commentId, message);
-
-    await supabase
-      .from("ig_comments")
-      .update({
-        private_replied_by_app: true,
-        private_replied_at: new Date().toISOString(),
-      })
-      .eq("ig_comment_id", req.params.commentId);
-
-    res.json({ ok: true, result });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.post("/api/comments/:commentId/like", async (req, res) => {
-  try {
-    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-
-    const response = await graphPostWithFallback(
-      `/${req.params.commentId}/likes`,
-      null,
-      {
-        access_token: token,
-      },
-      { preferMeta: true, timeout: 30000 },
-    );
-
-    res.json({ ok: true, result: response.data });
-  } catch (error) {
-    res.status(400).json({
-      ok: false,
-      unsupported: true,
-      error:
-        error.details ||
-        error.response?.data ||
-        "Instagram comment like is not supported by this API/token.",
-    });
-  }
-});
-
-app.post("/api/comments/:commentId/hide", async (req, res) => {
-  try {
-    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-    const hide = req.body.hide !== false;
-
-    const response = await graphPostWithFallback(
-      `/${req.params.commentId}`,
-      null,
-      {
-        hide,
-        access_token: token,
-      },
-      { preferMeta: true, timeout: 30000 },
-    );
-
-    await supabase
-      ?.from("ig_comments")
-      .update({ is_hidden: hide })
-      .eq("ig_comment_id", req.params.commentId);
-
-    res.json({ ok: true, result: response.data });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.details || error.response?.data || error.message,
-    });
-  }
-});
-
-app.delete("/api/comments/:commentId", async (req, res) => {
-  try {
-    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
-
-    const response = await axios.delete(metaGraphUrl(`/${req.params.commentId}`), {
-      params: { access_token: token },
-      timeout: 30000,
-    });
-
-    await supabase
-      ?.from("ig_comments")
-      .update({ is_deleted: true })
-      .eq("ig_comment_id", req.params.commentId);
-
-    res.json({ ok: true, result: response.data });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message,
-    });
-  }
-});
-
-/**
- * AUTO REPLY RULES
- */
-app.get("/api/comments/auto-reply/rules", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data, error } = await supabase
-      .from("ig_auto_reply_rules")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) throw error;
-
-    res.json({ ok: true, rules: data || [] });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/comments/auto-reply/rules", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const body = req.body;
-
-    const { data, error } = await supabase
-      .from("ig_auto_reply_rules")
-      .insert({
-        name: body.name,
-        is_enabled: body.isEnabled ?? body.is_enabled ?? false,
-        trigger_type: body.triggerType || body.trigger_type || "any_comment",
-        keywords: Array.isArray(body.keywords) ? body.keywords : [],
-        reply_mode: body.replyMode || body.reply_mode || "private_reply",
-        public_reply_text: body.publicReplyText || body.public_reply_text || null,
-        private_reply_text: body.privateReplyText || body.private_reply_text || null,
-        only_once_per_user: body.onlyOncePerUser ?? body.only_once_per_user ?? true,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    res.json({ ok: true, rule: data });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.patch("/api/comments/auto-reply/rules/:id", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const body = req.body;
-    const update = {};
-
-    if (body.name !== undefined) update.name = body.name;
-    if (body.isEnabled !== undefined || body.is_enabled !== undefined) {
-      update.is_enabled = body.isEnabled ?? body.is_enabled;
-    }
-    if (body.triggerType !== undefined || body.trigger_type !== undefined) {
-      update.trigger_type = body.triggerType || body.trigger_type;
-    }
-    if (body.keywords !== undefined) update.keywords = body.keywords;
-    if (body.replyMode !== undefined || body.reply_mode !== undefined) {
-      update.reply_mode = body.replyMode || body.reply_mode;
-    }
-    if (body.publicReplyText !== undefined || body.public_reply_text !== undefined) {
-      update.public_reply_text = body.publicReplyText ?? body.public_reply_text;
-    }
-    if (body.privateReplyText !== undefined || body.private_reply_text !== undefined) {
-      update.private_reply_text = body.privateReplyText ?? body.private_reply_text;
-    }
-    if (body.onlyOncePerUser !== undefined || body.only_once_per_user !== undefined) {
-      update.only_once_per_user = body.onlyOncePerUser ?? body.only_once_per_user;
-    }
-
-    const { data, error } = await supabase
-      .from("ig_auto_reply_rules")
-      .update(update)
-      .eq("id", req.params.id)
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    res.json({ ok: true, rule: data });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.delete("/api/comments/auto-reply/rules/:id", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { error } = await supabase
-      .from("ig_auto_reply_rules")
-      .delete()
-      .eq("id", req.params.id);
-
-    if (error) throw error;
-
-    res.json({ ok: true, deleted: true });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-/**
- * POSTS
- */
-app.post("/api/posts", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const isBulk =
-      Array.isArray(req.body) ||
-      Array.isArray(req.body.posts) ||
-      Array.isArray(req.body.items);
-
-    if (isBulk) {
-      const items = Array.isArray(req.body)
-        ? req.body
-        : req.body.posts || req.body.items;
-
-      const created = [];
-      const failed = [];
-
-      for (const item of items) {
-        try {
-          const post = await createScheduledPostFromInput(item);
-          created.push(post);
-        } catch (error) {
-          failed.push({
-            item,
-            error: error.message,
-            details: error.details || null,
-          });
-        }
-      }
-
-      return res.json({
-        ok: failed.length === 0,
-        posts: created.map(withAliases),
-        createdCount: created.length,
-        failedCount: failed.length,
-        failed,
-      });
-    }
-
-    const post = await createScheduledPostFromInput(req.body);
-
-    res.json({ ok: true, post: withAliases(post) });
-  } catch (error) {
-    res.status(error.statusCode || 500).json({
-      ok: false,
-      error: error.response?.data || error.message || String(error),
-      details: error.details || null,
-    });
-  }
-});
-
-app.get("/api/posts", async (_req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data, error } = await supabase
-      .from("scheduled_posts")
-      .select("*")
-      .order("scheduled_at", { ascending: true });
-
-    if (error) throw error;
-
-    res.json({ ok: true, posts: (data || []).map(withAliases) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.patch("/api/posts/:id", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const update = {};
-
-    if (req.body.caption !== undefined) update.caption = req.body.caption;
-    if (req.body.hashtags !== undefined) update.hashtags = normalizeHashtags(req.body.hashtags);
-    if (req.body.finalText !== undefined || req.body.final_text !== undefined) {
-      update.final_text = req.body.finalText || req.body.final_text;
-    }
-    if (req.body.scheduledAt !== undefined || req.body.scheduled_at !== undefined) {
-      update.scheduled_at = req.body.scheduledAt || req.body.scheduled_at;
-    }
-    if (req.body.status !== undefined) update.status = req.body.status;
-
-    update.updated_at = new Date().toISOString();
-
-    const { data, error } = await supabase
-      .from("scheduled_posts")
-      .update(update)
-      .eq("id", req.params.id)
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    res.json({ ok: true, post: withAliases(data) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.delete("/api/posts/:id", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data, error } = await supabase
-      .from("scheduled_posts")
-      .update({
-        status: "cancelled",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", req.params.id)
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    res.json({ ok: true, post: withAliases(data) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post("/api/posts/:id/retry", async (req, res) => {
-  try {
-    requireSupabaseConfig();
-
-    const { data: post, error } = await supabase
-      .from("scheduled_posts")
-      .select("*")
-      .eq("id", req.params.id)
-      .single();
-
-    if (error) throw error;
-
-    const updatedPost = await publishScheduledPost(post);
-
-    res.json({ ok: true, post: withAliases(updatedPost) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.response?.data || error.message });
-  }
-});
-
-/**
- * CRON
- */
-cron.schedule("*/5 * * * *", async () => {
-  try {
-    if (!supabase) {
-      console.warn("Supabase not configured. Cron skipped.");
-      return;
-    }
-
-    const nowIso = new Date().toISOString();
-
-    const { data: duePosts, error } = await supabase
-      .from("scheduled_posts")
-      .select("*")
-      .in("status", ["approved", "scheduled"])
-      .lte("scheduled_at", nowIso)
-      .lt("publish_attempts", 3)
-      .order("scheduled_at", { ascending: true })
-      .limit(10);
-
-    if (error) throw error;
-
-    for (const post of duePosts || []) {
-      try {
-        await publishScheduledPost(post);
-      } catch (error) {
-        console.error(
-          `Failed scheduled post ${post.id}:`,
-          error.response?.data || error.message,
-        );
-      }
-    }
-  } catch (error) {
-    console.error("Cron scheduler failed:", error.response?.data || error.message);
-  }
-});
-
-/**
- * 404
- */
-app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: `Endpoint not found: ${req.method} ${req.originalUrl}`,
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`AutoFlow Backend running on port ${PORT}`);
-});
+    const resolution = Number(req.body.resol
