@@ -8,7 +8,7 @@ import fs from "fs";
 import path from "path";
 import sharp from "sharp";
 import { v2 as cloudinary } from "cloudinary";
-import { randomUUID } from "crypto";
+import { randomUUID, createHmac, timingSafeEqual } from "crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { createClient } from "@supabase/supabase-js";
@@ -18,16 +18,32 @@ dotenv.config();
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(
+  express.json({
+    limit: "50mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
-const GRAPH_VERSION = process.env.GRAPH_VERSION || "v25.0";
+const IG_GRAPH_HOST = process.env.GRAPH_HOST || "https://graph.instagram.com";
+const META_GRAPH_HOST = process.env.META_GRAPH_HOST || "https://graph.facebook.com";
+const GRAPH_VERSION = process.env.GRAPH_VERSION || process.env.META_GRAPH_VERSION || "v25.0";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const IG_USER_ID = process.env.IG_USER_ID;
+
+const META_APP_SECRET = process.env.META_APP_SECRET;
+const META_WEBHOOK_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN;
+
+const FACEBOOK_PAGE_ID = process.env.FACEBOOK_PAGE_ID;
+const FACEBOOK_PAGE_ACCESS_TOKEN = process.env.FACEBOOK_PAGE_ACCESS_TOKEN;
+
+const AUTO_REPLY_ENABLED = String(process.env.AUTO_REPLY_ENABLED || "false").toLowerCase() === "true";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -38,12 +54,10 @@ const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
-const DEFAULT_BUSINESS_NAME =
-  process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
+const DEFAULT_BUSINESS_NAME = process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
 const DEFAULT_LOCATION = process.env.DEFAULT_LOCATION || "UAE";
 const DEFAULT_CTA = process.env.DEFAULT_CTA || "Contact us today";
 const DEFAULT_HASHTAG_COUNT = Number(process.env.DEFAULT_HASHTAG_COUNT || 10);
-
 const AI_BULK_CONCURRENCY = Number(process.env.AI_BULK_CONCURRENCY || 2);
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
@@ -57,7 +71,7 @@ cloudinary.config({
   cloud_name: CLOUDINARY_CLOUD_NAME,
   api_key: CLOUDINARY_API_KEY,
   api_secret: CLOUDINARY_API_SECRET,
-  secure: true
+  secure: true,
 });
 
 const supabase =
@@ -67,7 +81,6 @@ const supabase =
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const tempDir = path.join(__dirname, "temp_uploads");
 
 if (!fs.existsSync(tempDir)) {
@@ -77,11 +90,11 @@ if (!fs.existsSync(tempDir)) {
 const upload = multer({
   dest: tempDir,
   limits: {
-    fileSize: 250 * 1024 * 1024
-  }
+    fileSize: 250 * 1024 * 1024,
+  },
 });
 
-app.use((req, res, next) => {
+app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
@@ -90,9 +103,27 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function requireMetaConfig() {
+function requireSupabaseConfig() {
+  if (!supabase) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.");
+  }
+}
+
+function requireCloudinaryConfig() {
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+    throw new Error("Missing Cloudinary environment variables.");
+  }
+}
+
+function requireMetaPublishConfig() {
   if (!META_ACCESS_TOKEN || !IG_USER_ID) {
     throw new Error("Missing META_ACCESS_TOKEN or IG_USER_ID.");
+  }
+}
+
+function requirePageMessagingConfig() {
+  if (!FACEBOOK_PAGE_ID || !FACEBOOK_PAGE_ACCESS_TOKEN) {
+    throw new Error("Missing FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN.");
   }
 }
 
@@ -102,20 +133,18 @@ function requireGeminiConfig(apiKey = GEMINI_API_KEY) {
   }
 }
 
-function requireCloudinaryConfig() {
-  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    throw new Error(
-      "Missing Cloudinary environment variables: CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET."
-    );
-  }
+function metaUrl(pathValue) {
+  const cleanPath = String(pathValue).startsWith("/")
+    ? String(pathValue)
+    : `/${pathValue}`;
+  return `${META_GRAPH_HOST}/${GRAPH_VERSION}${cleanPath}`;
 }
 
-function requireSupabaseConfig() {
-  if (!supabase) {
-    throw new Error(
-      "Missing Supabase environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY."
-    );
-  }
+function igUrl(pathValue) {
+  const cleanPath = String(pathValue).startsWith("/")
+    ? String(pathValue)
+    : `/${pathValue}`;
+  return `${IG_GRAPH_HOST}/${GRAPH_VERSION}${cleanPath}`;
 }
 
 function cleanupFile(filePath) {
@@ -124,7 +153,7 @@ function cleanupFile(filePath) {
       fs.unlinkSync(filePath);
     }
   } catch {
-    // Ignore cleanup errors.
+    // ignore
   }
 }
 
@@ -139,9 +168,8 @@ function isPublicHttpsUrl(url) {
 
 function isValidUuid(value) {
   if (!value) return false;
-
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(value).trim()
+    String(value).trim(),
   );
 }
 
@@ -151,8 +179,15 @@ function firstDefined(...values) {
       return value;
     }
   }
-
   return null;
+}
+
+function parseJsonLoose(text) {
+  try {
+    return JSON.parse(String(text).replace(/```json|```/g, "").trim());
+  } catch {
+    return null;
+  }
 }
 
 function normalizeHashtags(hashtags) {
@@ -177,15 +212,7 @@ function normalizeHashtags(hashtags) {
 }
 
 function getBodyValue(body, camelKey, snakeKey) {
-  return body[camelKey] ?? body[snakeKey];
-}
-
-function parseJsonLoose(text) {
-  try {
-    return JSON.parse(String(text).replace(/```json|```/g, "").trim());
-  } catch {
-    return null;
-  }
+  return body?.[camelKey] ?? body?.[snakeKey];
 }
 
 function detectMediaTypeFromUrl(url) {
@@ -228,11 +255,7 @@ function detectMediaTypeFromFile(file) {
     return "image";
   }
 
-  if (
-    name.endsWith(".mp4") ||
-    name.endsWith(".mov") ||
-    name.endsWith(".m4v")
-  ) {
+  if (name.endsWith(".mp4") || name.endsWith(".mov") || name.endsWith(".m4v")) {
     return "video";
   }
 
@@ -263,67 +286,8 @@ function getProviderApiKey({ provider, apiKey }) {
   return null;
 }
 
-function classifyModel(provider, modelId, raw = {}) {
-  const id = String(modelId || "").replace("models/", "");
-  const lower = id.toLowerCase();
-  const methods = raw.supportedGenerationMethods || [];
-
-  const isEmbedding =
-    lower.includes("embedding") ||
-    lower.includes("embed") ||
-    lower.includes("aqa");
-
-  const supportsText =
-    provider === "gemini"
-      ? methods.includes("generateContent") && !isEmbedding
-      : !isEmbedding;
-
-  const supportsImage =
-    lower.includes("image") ||
-    lower.includes("imagen") ||
-    lower.includes("vision") ||
-    lower.includes("gpt-4o") ||
-    lower.includes("nano");
-
-  const supportsVideo = lower.includes("video") || lower.includes("veo");
-
-  let type = "text";
-
-  if (supportsVideo) type = "video";
-  else if (supportsImage) type = "image";
-
-  let isFree = false;
-
-  if (provider === "gemini") {
-    isFree = true;
-  }
-
-  if (provider === "openrouter") {
-    const pricing = raw.pricing || {};
-    const promptPrice = Number(pricing.prompt || 0);
-    const completionPrice = Number(pricing.completion || 0);
-
-    isFree =
-      lower.includes(":free") ||
-      (promptPrice === 0 && completionPrice === 0);
-  }
-
-  return {
-    id,
-    name: raw.name || id,
-    displayName: raw.displayName || raw.name || id,
-    description: raw.description || "",
-    type,
-    supportsText,
-    supportsImage,
-    supportsVideo,
-    isFree,
-    supportedGenerationMethods: methods
-  };
-}
-
 function extractBodySource(body) {
-  return body.post || body.item || body.data || body.payload || body;
+  return body?.post || body?.item || body?.data || body?.payload || body || {};
 }
 
 function normalizeMediaInput(body) {
@@ -337,21 +301,21 @@ function normalizeMediaInput(body) {
     source.media_id,
     media.mediaAssetId,
     media.media_asset_id,
-    media.id
+    media.id,
   );
 
   const imageUrl = firstDefined(
     source.imageUrl,
     source.image_url,
     media.imageUrl,
-    media.image_url
+    media.image_url,
   );
 
   const videoUrl = firstDefined(
     source.videoUrl,
     source.video_url,
     media.videoUrl,
-    media.video_url
+    media.video_url,
   );
 
   const mediaUrl = firstDefined(
@@ -364,14 +328,14 @@ function normalizeMediaInput(body) {
     media.media_url,
     media.url,
     imageUrl,
-    videoUrl
+    videoUrl,
   );
 
   let mediaType = firstDefined(
     source.mediaType,
     source.media_type,
     media.mediaType,
-    media.media_type
+    media.media_type,
   );
 
   mediaType = mediaType ? String(mediaType).toLowerCase() : null;
@@ -388,7 +352,7 @@ function normalizeMediaInput(body) {
     mediaUrl,
     imageUrl,
     videoUrl,
-    mediaType
+    mediaType,
   };
 }
 
@@ -407,16 +371,13 @@ function normalizeScheduledAt(body) {
     source.dateTime,
     source.datetime,
     source.date_time,
-    source.time
+    source.time,
   );
 }
 
 function normalizeCaption(body) {
   const source = extractBodySource(body);
-
-  return String(
-    firstDefined(source.caption, source.finalText, source.final_text, "") || ""
-  );
+  return String(firstDefined(source.caption, source.finalText, source.final_text, "") || "");
 }
 
 function normalizeInputHashtags(body) {
@@ -424,26 +385,25 @@ function normalizeInputHashtags(body) {
   return normalizeHashtags(source.hashtags || source.tags || []);
 }
 
-async function fetchMediaAssetById(mediaAssetId) {
-  if (!isValidUuid(mediaAssetId)) {
-    console.warn("Skipping invalid mediaAssetId:", mediaAssetId);
-    return null;
-  }
+function withAliases(row) {
+  if (!row || typeof row !== "object") return row;
 
-  requireSupabaseConfig();
-
-  const { data, error } = await supabase
-    .from("media_assets")
-    .select("*")
-    .eq("id", mediaAssetId)
-    .maybeSingle();
-
-  if (error) {
-    console.warn("Could not fetch media asset:", error.message);
-    return null;
-  }
-
-  return data;
+  return {
+    ...row,
+    mediaUrl: row.media_url ?? row.mediaUrl,
+    imageUrl: row.image_url ?? row.imageUrl,
+    videoUrl: row.video_url ?? row.videoUrl,
+    mediaType: row.media_type ?? row.mediaType,
+    createdAt: row.created_at ?? row.createdAt,
+    updatedAt: row.updated_at ?? row.updatedAt,
+    scheduledAt: row.scheduled_at ?? row.scheduledAt,
+    publishedAt: row.published_at ?? row.publishedAt,
+    mediaAssetId: row.media_asset_id ?? row.mediaAssetId,
+    sourceMediaAssetId: row.source_media_asset_id ?? row.sourceMediaAssetId,
+    isAiGenerated: row.is_ai_generated ?? row.isAiGenerated,
+    isPublished: row.is_published ?? row.isPublished,
+    isScheduled: row.is_scheduled ?? row.isScheduled,
+  };
 }
 
 async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
@@ -485,7 +445,7 @@ async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
 async function fetchImageAsInlineData(imageUrl) {
   const response = await axios.get(imageUrl, {
     responseType: "arraybuffer",
-    timeout: 30000
+    timeout: 30000,
   });
 
   const mimeType =
@@ -497,8 +457,8 @@ async function fetchImageAsInlineData(imageUrl) {
   return {
     inlineData: {
       mimeType,
-      data: Buffer.from(response.data).toString("base64")
-    }
+      data: Buffer.from(response.data).toString("base64"),
+    },
   };
 }
 
@@ -525,7 +485,7 @@ async function uploadImageToCloudinary(filePath) {
     use_filename: false,
     unique_filename: true,
     overwrite: false,
-    format: "jpg"
+    format: "jpg",
   });
 
   return result.secure_url;
@@ -539,7 +499,7 @@ async function uploadVideoToCloudinary(filePath) {
     folder: "autoflow/videos",
     use_filename: false,
     unique_filename: true,
-    overwrite: false
+    overwrite: false,
   });
 
   return result.secure_url;
@@ -552,7 +512,7 @@ async function uploadNormalizedImage(file) {
     .rotate()
     .jpeg({
       quality: 92,
-      mozjpeg: true
+      mozjpeg: true,
     })
     .toFile(normalizedPath);
 
@@ -566,7 +526,7 @@ async function uploadNormalizedImage(file) {
     imageUrl: secureUrl,
     videoUrl: null,
     mediaType: "image",
-    mimeType: "image/jpeg"
+    mimeType: "image/jpeg",
   };
 }
 
@@ -580,55 +540,38 @@ async function uploadVideo(file) {
     imageUrl: null,
     videoUrl: secureUrl,
     mediaType: "video",
-    mimeType: file.mimetype || "video/mp4"
+    mimeType: file.mimetype || "video/mp4",
   };
 }
 
+/**
+ * INSTAGRAM PUBLISH
+ */
 async function pollMediaContainerStatus(containerId) {
-  console.log(`Waiting for Meta container to be ready: ${containerId}`);
-
   await sleep(3000);
 
   for (let attempt = 1; attempt <= 24; attempt += 1) {
     try {
-      const response = await axios.get(
-        `${GRAPH_HOST}/${GRAPH_VERSION}/${containerId}`,
-        {
-          params: {
-            fields: "status_code,status",
-            access_token: META_ACCESS_TOKEN
-          },
-          timeout: 30000
-        }
-      );
+      const response = await axios.get(igUrl(`/${containerId}`), {
+        params: {
+          fields: "status_code,status",
+          access_token: META_ACCESS_TOKEN,
+        },
+        timeout: 30000,
+      });
 
       const statusCode = response.data?.status_code;
       const status = response.data?.status;
 
-      console.log(
-        `Meta container ${containerId} status attempt ${attempt}:`,
-        statusCode || status || response.data
-      );
-
-      if (statusCode === "FINISHED") {
-        return response.data;
-      }
+      if (statusCode === "FINISHED") return response.data;
 
       if (statusCode === "ERROR") {
-        throw new Error(
-          `Meta media container failed: ${status || "Unknown error"}`
-        );
+        throw new Error(`Meta media container failed: ${status || "Unknown error"}`);
       }
 
       await sleep(5000);
     } catch (error) {
-      console.warn(
-        `Meta container status check failed attempt ${attempt}:`,
-        error.response?.data || error.message
-      );
-
       if (attempt === 24) throw error;
-
       await sleep(5000);
     }
   }
@@ -636,14 +579,8 @@ async function pollMediaContainerStatus(containerId) {
   throw new Error("Meta media container did not finish processing in time.");
 }
 
-async function publishToInstagram({
-  mediaUrl,
-  imageUrl,
-  videoUrl,
-  mediaType,
-  caption
-}) {
-  requireMetaConfig();
+async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, caption }) {
+  requireMetaPublishConfig();
 
   const finalMediaUrl = mediaUrl || imageUrl || videoUrl;
   const finalMediaType = mediaType || detectMediaTypeFromUrl(finalMediaUrl);
@@ -656,11 +593,9 @@ async function publishToInstagram({
     throw new Error("mediaType must be image or video.");
   }
 
-  const createContainerUrl = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}/media`;
-
   const params = {
     caption: caption || "",
-    access_token: META_ACCESS_TOKEN
+    access_token: META_ACCESS_TOKEN,
   };
 
   if (finalMediaType === "image") {
@@ -673,14 +608,9 @@ async function publishToInstagram({
     params.media_type = "VIDEO";
   }
 
-  console.log("Creating Meta media container:", {
-    mediaType: finalMediaType,
-    mediaUrl: finalMediaUrl
-  });
-
-  const containerResponse = await axios.post(createContainerUrl, null, {
+  const containerResponse = await axios.post(igUrl(`/${IG_USER_ID}/media`), null, {
     params,
-    timeout: 60000
+    timeout: 60000,
   });
 
   const creationId = containerResponse.data?.id;
@@ -689,37 +619,24 @@ async function publishToInstagram({
     throw new Error("Meta did not return creation_id.");
   }
 
-  console.log(`Meta media container created: ${creationId}`);
-
   await pollMediaContainerStatus(creationId);
-
-  const publishUrl = `${GRAPH_HOST}/${GRAPH_VERSION}/${IG_USER_ID}/media_publish`;
 
   let publishResponse = null;
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      console.log(`Publishing Meta container ${creationId}, attempt ${attempt}`);
-
-      publishResponse = await axios.post(publishUrl, null, {
+      publishResponse = await axios.post(igUrl(`/${IG_USER_ID}/media_publish`), null, {
         params: {
           creation_id: creationId,
-          access_token: META_ACCESS_TOKEN
+          access_token: META_ACCESS_TOKEN,
         },
-        timeout: 60000
+        timeout: 60000,
       });
-
       break;
     } catch (error) {
       const metaCode = error.response?.data?.error?.code;
 
-      console.warn(
-        `Meta publish failed attempt ${attempt}:`,
-        error.response?.data || error.message
-      );
-
       if (metaCode === 9007 && attempt < 3) {
-        console.warn("Meta media not ready. Retrying publish in 10 seconds...");
         await sleep(10000);
         await pollMediaContainerStatus(creationId);
         continue;
@@ -737,10 +654,13 @@ async function publishToInstagram({
     creationId,
     publishId: publishResponse.data.id,
     mediaType: finalMediaType,
-    mediaUrl: finalMediaUrl
+    mediaUrl: finalMediaUrl,
   };
 }
 
+/**
+ * GEMINI / AI
+ */
 function getPresetInstruction(captionPreset, customPrompt) {
   const preset = String(captionPreset || "Luxury Product Caption").trim();
 
@@ -768,7 +688,7 @@ function getPresetInstruction(captionPreset, customPrompt) {
     "Arabic Social Media Caption":
       "Write natural Arabic social media copy. Make it premium but not stiff or over-formal.",
     "Before / After Style":
-      "Write like a transformation post. Emphasize how the decor changes the feeling of the space."
+      "Write like a transformation post. Emphasize how the decor changes the feeling of the space.",
   };
 
   return presets[preset] || presets["Luxury Product Caption"];
@@ -782,7 +702,7 @@ function buildCaptionPrompt({
   businessName,
   location,
   cta,
-  hashtagCount
+  hashtagCount,
 }) {
   const presetInstruction = getPresetInstruction(captionPreset, customPrompt);
   const safeHashtagCount = Number.isFinite(Number(hashtagCount))
@@ -795,12 +715,10 @@ You are a senior Instagram marketing copywriter for ${businessName}, a ${locatio
 Analyze the image carefully before writing.
 
 Identify what is visible:
-- Is it an artificial tree, flowers, greenery wall, planter, staircase decor, entrance decor, villa decor, commercial decor, or another product?
-- What colors are visible?
-- What style does the space or product suggest?
-- Is it luxury, modern, natural, minimal, classic, or commercial?
-- What customer would want this?
-- What is the strongest marketing angle?
+- Product type.
+- Colors.
+- Space style.
+- Strongest marketing angle.
 
 Caption preset:
 ${captionPreset}
@@ -814,19 +732,11 @@ ${language}
 Tone:
 ${tone}
 
-Business name:
-${businessName}
-
-Location:
-${location}
-
 CTA:
 ${cta}
 
 Hashtag count:
 ${safeHashtagCount}
-
-Write a caption that matches the actual visible image, not a generic caption.
 
 Return strict JSON only:
 {
@@ -844,16 +754,8 @@ Rules:
 - Do not write "#hashtag1".
 - Do not invent discounts, offers, guarantees, or prices.
 - Do not mention AI.
-- Do not say "in the image" unless it is necessary.
-- Mention artificial tree / artificial flowers only when visually relevant.
-- If the product looks like an artificial olive tree, mention artificial olive tree.
-- If the product looks like flowers, mention floral arrangement, colors, and styling.
-- If the setting looks like an entrance, staircase, villa, hotel, mall, showroom, or commercial decor, mention that appropriately.
-- Hashtags must be relevant to UAE decor, artificial trees, artificial flowers, interiors, villas, hotels, landscaping, or the detected product.
+- Arabic must sound natural and premium.
 - Use no more than ${safeHashtagCount} hashtags.
-- Arabic captions must sound natural, premium, and social-media-ready, not literal translation.
-- English captions must be clean, premium, and concise.
-- If language is Arabic + English, write a short Arabic caption followed by a short English line.
 `;
 }
 
@@ -863,27 +765,27 @@ function buildFixedAiEditRules({
   outputSize = "1080x1350",
   aspectRatio = "4:5",
   resolution = 1080,
-  quality = "high"
+  quality = "high",
 }) {
   const rules = [
     "The result must be photorealistic and look like real professional photography.",
     "Keep natural perspective, believable scale, correct shadows, realistic lighting, and harmonious colors.",
     "No cartoon, no painting, no CGI look, no artificial AI artifacts.",
-    "No text, no watermark, no logos unless already part of the original product."
+    "No text, no watermark.",
   ];
 
   if (preserveProduct) {
     rules.push(
       "Keep the original tree / plant / flower arrangement exactly unchanged.",
-      "Do NOT change the product shape, structure, trunk, bark, branches, leaves, flowers, colors, density, height, width, proportions, angle, or realism.",
-      "Preserve the original product identity exactly."
+      "Do NOT change product shape, structure, trunk, branches, leaves, flowers, colors, density, height, width, proportions, angle, or realism.",
+      "Preserve the original product identity exactly.",
     );
   }
 
   if (keepPot) {
     rules.push(
-      "Keep the pot / planter / base exactly unchanged unless the user explicitly asks to change it.",
-      "Do NOT change the pot shape, color, material, texture, size, or placement."
+      "Keep the pot / planter / base exactly unchanged unless explicitly asked.",
+      "Do NOT change pot shape, color, material, texture, size, or placement.",
     );
   }
 
@@ -892,7 +794,7 @@ function buildFixedAiEditRules({
     `Output aspect ratio: ${aspectRatio}.`,
     `Target output size: ${outputSize}.`,
     `Target resolution: ${resolution}.`,
-    `Quality level: ${quality}.`
+    `Quality level: ${quality}.`,
   );
 
   return rules;
@@ -925,7 +827,7 @@ function getAiEditPresetInstruction(preset, customPrompt) {
     "Outdoor Courtyard":
       "Place the product in a realistic outdoor courtyard with natural light, architectural walls, stone or marble floor, and subtle landscape details.",
     "Neutral Studio Background":
-      "Place the product on a clean neutral studio background with realistic soft shadows and premium product photography lighting."
+      "Place the product on a clean neutral studio background with realistic soft shadows and premium product photography lighting.",
   };
 
   return presets[cleanPreset] || presets["Luxury Interior"];
@@ -942,7 +844,7 @@ function buildAiEditPrompt({
   resolution = 1080,
   quality = "high",
   backgroundIntensity = "medium",
-  userPrompt = ""
+  userPrompt = "",
 }) {
   const fixedRules = buildFixedAiEditRules({
     preserveProduct,
@@ -950,7 +852,7 @@ function buildAiEditPrompt({
     outputSize,
     aspectRatio,
     resolution,
-    quality
+    quality,
   });
 
   const presetInstruction = getAiEditPresetInstruction(preset, customPrompt);
@@ -974,23 +876,19 @@ Fixed preservation rules:
 ${fixedRules.map((rule) => `- ${rule}`).join("\n")}
 
 Scene realism rules:
-- The edited image must match the original camera angle.
-- The product must sit naturally in the new space.
-- Scale must be believable relative to the floor, walls, furniture, and architecture.
-- Lighting direction must be consistent across product and environment.
+- Match the original camera angle.
+- Product must sit naturally in the new space.
+- Scale must be believable.
+- Lighting direction must be consistent.
 - Shadows must be realistic and grounded.
 - Colors must be harmonious and not oversaturated.
-- The final image must be suitable for premium Instagram marketing and product presentation.
+- Suitable for premium Instagram marketing.
 
 Return only the edited image.
 `;
 }
 
-async function generateTextWithGemini(
-  prompt,
-  modelName = GEMINI_TEXT_MODEL,
-  apiKey = GEMINI_API_KEY
-) {
+async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL, apiKey = GEMINI_API_KEY) {
   requireGeminiConfig(apiKey);
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -1000,12 +898,12 @@ async function generateTextWithGemini(
   return result.response.text();
 }
 
-async function generateCaptionWithGeminiVision({
+async function generateVisionWithGemini({
   imageUrl,
   prompt,
   modelName = GEMINI_TEXT_MODEL,
   apiKey = GEMINI_API_KEY,
-  fallbackTextOnly = false
+  fallbackTextOnly = false,
 }) {
   requireGeminiConfig(apiKey);
 
@@ -1028,52 +926,6 @@ async function generateCaptionWithGeminiVision({
   }
 }
 
-async function generateCaptionWithOpenAI({
-  provider,
-  apiKey,
-  model,
-  imageUrl,
-  prompt
-}) {
-  const endpoint =
-    provider === "openrouter"
-      ? "https://openrouter.ai/api/v1/chat/completions"
-      : "https://api.openai.com/v1/chat/completions";
-
-  const response = await axios.post(
-    endpoint,
-    {
-      model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: prompt
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: imageUrl
-              }
-            }
-          ]
-        }
-      ]
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      timeout: 90000
-    }
-  );
-
-  return response.data?.choices?.[0]?.message?.content || "";
-}
-
 async function generateCaptionWithAI({
   provider = "gemini",
   apiKey,
@@ -1087,13 +939,10 @@ async function generateCaptionWithAI({
   location = DEFAULT_LOCATION,
   cta = DEFAULT_CTA,
   hashtagCount = DEFAULT_HASHTAG_COUNT,
-  fallbackTextOnly = false
+  fallbackTextOnly = false,
 }) {
   const selectedProvider = normalizeProvider(provider);
-  const selectedApiKey = getProviderApiKey({
-    provider: selectedProvider,
-    apiKey
-  });
+  const selectedApiKey = getProviderApiKey({ provider: selectedProvider, apiKey });
 
   if (!selectedApiKey) {
     throw new Error(`Missing API key for provider: ${selectedProvider}`);
@@ -1107,28 +956,20 @@ async function generateCaptionWithAI({
     businessName,
     location,
     cta,
-    hashtagCount
+    hashtagCount,
   });
 
-  let text = "";
-
-  if (selectedProvider === "gemini") {
-    text = await generateCaptionWithGeminiVision({
-      imageUrl,
-      prompt,
-      modelName: model || GEMINI_TEXT_MODEL,
-      apiKey: selectedApiKey,
-      fallbackTextOnly
-    });
-  } else {
-    text = await generateCaptionWithOpenAI({
-      provider: selectedProvider,
-      apiKey: selectedApiKey,
-      model,
-      imageUrl,
-      prompt
-    });
+  if (selectedProvider !== "gemini") {
+    throw new Error("Caption generation currently supports Gemini in this backend.");
   }
+
+  const text = await generateVisionWithGemini({
+    imageUrl,
+    prompt,
+    modelName: model || GEMINI_TEXT_MODEL,
+    apiKey: selectedApiKey,
+    fallbackTextOnly,
+  });
 
   const parsed = parseJsonLoose(text);
 
@@ -1139,7 +980,7 @@ async function generateCaptionWithAI({
       alt_text: parsed.alt_text || "",
       detected_product: parsed.detected_product || "",
       visual_description: parsed.visual_description || "",
-      marketing_angle: parsed.marketing_angle || ""
+      marketing_angle: parsed.marketing_angle || "",
     };
   }
 
@@ -1149,7 +990,7 @@ async function generateCaptionWithAI({
     alt_text: "",
     detected_product: "",
     visual_description: "",
-    marketing_angle: ""
+    marketing_angle: "",
   };
 }
 
@@ -1162,7 +1003,7 @@ async function generateEditPromptWithGemini({
   language = "english",
   customPrompt = "",
   model = GEMINI_TEXT_MODEL,
-  apiKey = GEMINI_API_KEY
+  apiKey = GEMINI_API_KEY,
 }) {
   const basePrompt = buildAiEditPrompt({
     preset,
@@ -1170,12 +1011,6 @@ async function generateEditPromptWithGemini({
     editMode,
     preserveProduct,
     keepPot,
-    userPrompt: "",
-    aspectRatio: "4:5",
-    outputSize: "1080x1350",
-    resolution: 1080,
-    quality: "high",
-    backgroundIntensity: "medium"
   });
 
   const analysisPrompt = `
@@ -1190,9 +1025,7 @@ ${preset}
 Edit mode:
 ${editMode}
 
-The generated prompt must preserve the product exactly and change only the requested environment.
-
-Use these fixed rules as mandatory:
+Mandatory fixed rules:
 ${basePrompt}
 
 Return strict JSON only:
@@ -1204,12 +1037,12 @@ Return strict JSON only:
 }
 `;
 
-  const text = await generateCaptionWithGeminiVision({
+  const text = await generateVisionWithGemini({
     imageUrl,
     prompt: analysisPrompt,
     modelName: model,
     apiKey,
-    fallbackTextOnly: false
+    fallbackTextOnly: false,
   });
 
   const parsed = parseJsonLoose(text);
@@ -1221,15 +1054,11 @@ Return strict JSON only:
     fixedRules:
       Array.isArray(parsed?.fixedRules) && parsed.fixedRules.length > 0
         ? parsed.fixedRules
-        : buildFixedAiEditRules({})
+        : buildFixedAiEditRules({}),
   };
 }
 
-async function editImageWithGemini({
-  originalImageUrl,
-  prompt,
-  model = GEMINI_IMAGE_MODEL
-}) {
+async function editImageWithGemini({ originalImageUrl, prompt, model = GEMINI_IMAGE_MODEL }) {
   requireGeminiConfig(GEMINI_API_KEY);
 
   if (!originalImageUrl || !isPublicHttpsUrl(originalImageUrl)) {
@@ -1246,22 +1075,20 @@ async function editImageWithGemini({
     contents: [
       {
         role: "user",
-        parts: [{ text: prompt }, imagePart]
-      }
-    ]
+        parts: [{ text: prompt }, imagePart],
+      },
+    ],
   };
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-
-  const response = await axios.post(url, requestBody, {
-    params: {
-      key: GEMINI_API_KEY
+  const response = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    requestBody,
+    {
+      params: { key: GEMINI_API_KEY },
+      headers: { "Content-Type": "application/json" },
+      timeout: 180000,
     },
-    headers: {
-      "Content-Type": "application/json"
-    },
-    timeout: 180000
-  });
+  );
 
   const parts = response.data?.candidates?.[0]?.content?.parts || [];
   const imageOutput = parts.find((part) => part.inlineData || part.inline_data);
@@ -1271,7 +1098,7 @@ async function editImageWithGemini({
 
     throw new Error(
       textOutput ||
-        "Gemini image model did not return image data. Check image model access."
+        "Gemini image model did not return image data. Check image model access.",
     );
   }
 
@@ -1279,17 +1106,14 @@ async function editImageWithGemini({
 
   const tempImagePath = saveBase64TempImage({
     base64Data: inlineData.data,
-    mimeType: inlineData.mimeType || inlineData.mime_type || "image/png"
+    mimeType: inlineData.mimeType || inlineData.mime_type || "image/png",
   });
 
   const normalizedPath = path.join(tempDir, `${randomUUID()}.jpg`);
 
   await sharp(tempImagePath)
     .rotate()
-    .jpeg({
-      quality: 92,
-      mozjpeg: true
-    })
+    .jpeg({ quality: 92, mozjpeg: true })
     .toFile(normalizedPath);
 
   const editedImageUrl = await uploadImageToCloudinary(normalizedPath);
@@ -1303,7 +1127,7 @@ async function editImageWithGemini({
     mediaUrl: editedImageUrl,
     imageUrl: editedImageUrl,
     mediaType: "image",
-    model
+    model,
   };
 }
 
@@ -1318,15 +1142,9 @@ async function insertAiGeneratedMedia({
   aspectRatio,
   outputSize,
   resolution,
-  quality
+  quality,
 }) {
   requireSupabaseConfig();
-
-  const safeSourceMediaAssetId = isValidUuid(sourceMediaAssetId)
-    ? sourceMediaAssetId
-    : null;
-
-  const safeAiJobId = isValidUuid(aiJobId) ? aiJobId : null;
 
   const { data, error } = await supabase
     .from("media_assets")
@@ -1340,9 +1158,9 @@ async function insertAiGeneratedMedia({
       is_uploaded: true,
       is_scheduled: false,
       is_published: false,
-      source_media_asset_id: safeSourceMediaAssetId,
+      source_media_asset_id: isValidUuid(sourceMediaAssetId) ? sourceMediaAssetId : null,
       is_ai_generated: true,
-      ai_job_id: safeAiJobId,
+      ai_job_id: isValidUuid(aiJobId) ? aiJobId : null,
       ai_prompt: prompt,
       ai_edit_mode: editMode,
       ai_provider: provider,
@@ -1350,7 +1168,7 @@ async function insertAiGeneratedMedia({
       ai_aspect_ratio: aspectRatio,
       ai_output_size: outputSize,
       ai_resolution: Number(resolution) || null,
-      ai_quality: quality
+      ai_quality: quality,
     })
     .select()
     .single();
@@ -1360,6 +1178,9 @@ async function insertAiGeneratedMedia({
   return data;
 }
 
+/**
+ * SCHEDULE HELPERS
+ */
 async function markMediaPublished(mediaAssetId, publishedAt) {
   if (!mediaAssetId || !isValidUuid(mediaAssetId)) return;
 
@@ -1370,7 +1191,7 @@ async function markMediaPublished(mediaAssetId, publishedAt) {
     .update({
       is_published: true,
       published_at: publishedAt,
-      updated_at: new Date().toISOString()
+      updated_at: new Date().toISOString(),
     })
     .eq("id", mediaAssetId);
 }
@@ -1378,14 +1199,12 @@ async function markMediaPublished(mediaAssetId, publishedAt) {
 async function publishScheduledPost(post) {
   requireSupabaseConfig();
 
-  const nowIso = new Date().toISOString();
-
   await supabase
     .from("scheduled_posts")
     .update({
       status: "publishing",
       publish_attempts: (post.publish_attempts || 0) + 1,
-      updated_at: nowIso
+      updated_at: new Date().toISOString(),
     })
     .eq("id", post.id);
 
@@ -1395,7 +1214,7 @@ async function publishScheduledPost(post) {
       imageUrl: post.image_url,
       videoUrl: post.video_url,
       mediaType: post.media_type,
-      caption: post.final_text || post.caption || ""
+      caption: post.final_text || post.caption || "",
     });
 
     const publishedAt = new Date().toISOString();
@@ -1408,7 +1227,7 @@ async function publishScheduledPost(post) {
         meta_publish_id: result.publishId,
         published_at: publishedAt,
         error_message: null,
-        updated_at: publishedAt
+        updated_at: publishedAt,
       })
       .eq("id", post.id)
       .select()
@@ -1427,7 +1246,7 @@ async function publishScheduledPost(post) {
       .update({
         status: "failed",
         error_message: errorMessage,
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
       .eq("id", post.id);
 
@@ -1441,10 +1260,7 @@ async function createScheduledPostFromInput(inputBody) {
   let { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
     normalizeMediaInput(inputBody);
 
-  const mediaAsset = await resolveMediaAsset({
-    mediaAssetId,
-    mediaUrl
-  });
+  const mediaAsset = await resolveMediaAsset({ mediaAssetId, mediaUrl });
 
   if (mediaAsset) {
     mediaAssetId = mediaAsset.id;
@@ -1452,11 +1268,8 @@ async function createScheduledPostFromInput(inputBody) {
     imageUrl = imageUrl || mediaAsset.image_url;
     videoUrl = videoUrl || mediaAsset.video_url;
     mediaType = mediaType || mediaAsset.media_type;
-  } else {
-    if (!isValidUuid(mediaAssetId)) {
-      console.warn("Ignoring non-UUID mediaAssetId:", mediaAssetId);
-      mediaAssetId = null;
-    }
+  } else if (!isValidUuid(mediaAssetId)) {
+    mediaAssetId = null;
   }
 
   const caption = normalizeCaption(inputBody);
@@ -1466,34 +1279,14 @@ async function createScheduledPostFromInput(inputBody) {
   if (!mediaUrl || !scheduledAt) {
     const error = new Error("mediaUrl and scheduledAt are required.");
     error.statusCode = 400;
-    error.details = {
-      received: inputBody,
-      parsed: {
-        mediaAssetId,
-        mediaUrl,
-        imageUrl,
-        videoUrl,
-        mediaType,
-        scheduledAt
-      }
-    };
+    error.details = { received: inputBody };
     throw error;
   }
 
   if (mediaType !== "image" && mediaType !== "video") {
     const error = new Error("mediaType must be image or video.");
     error.statusCode = 400;
-    error.details = {
-      received: inputBody,
-      parsed: {
-        mediaAssetId,
-        mediaUrl,
-        imageUrl,
-        videoUrl,
-        mediaType,
-        scheduledAt
-      }
-    };
+    error.details = { received: inputBody };
     throw error;
   }
 
@@ -1502,57 +1295,40 @@ async function createScheduledPostFromInput(inputBody) {
   if (Number.isNaN(parsedDate.getTime())) {
     const error = new Error("scheduledAt is not a valid date.");
     error.statusCode = 400;
-    error.details = {
-      received: inputBody,
-      scheduledAt
-    };
     throw error;
   }
 
   const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
 
-  const insertPayload = {
-    media_asset_id: mediaAssetId,
-    media_url: mediaUrl,
-    image_url: imageUrl,
-    video_url: videoUrl,
-    media_type: mediaType,
-    caption,
-    hashtags,
-    final_text: finalText,
-    scheduled_at: parsedDate.toISOString(),
-    status: "approved"
-  };
-
-  console.log("Creating scheduled post payload:", insertPayload);
-
   const { data: post, error } = await supabase
     .from("scheduled_posts")
-    .insert(insertPayload)
+    .insert({
+      media_asset_id: mediaAssetId,
+      media_url: mediaUrl,
+      image_url: imageUrl,
+      video_url: videoUrl,
+      media_type: mediaType,
+      caption,
+      hashtags,
+      final_text: finalText,
+      scheduled_at: parsedDate.toISOString(),
+      status: "approved",
+    })
     .select()
     .single();
 
-  if (error) {
-    console.error("Supabase insert scheduled_posts failed:", error);
-    throw error;
-  }
+  if (error) throw error;
 
   if (mediaAssetId && isValidUuid(mediaAssetId)) {
-    const { error: mediaUpdateError } = await supabase
+    await supabase
       .from("media_assets")
       .update({
         is_scheduled: true,
         scheduled_post_id: post.id,
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
       .eq("id", mediaAssetId);
-
-    if (mediaUpdateError) {
-      console.warn("Media asset schedule flag update failed:", mediaUpdateError);
-    }
   }
-
-  console.log("Scheduled post created:", post.id);
 
   return post;
 }
@@ -1567,9 +1343,7 @@ async function runWithConcurrency(items, concurrency, task) {
     while (true) {
       const currentIndex = nextIndex;
       nextIndex += 1;
-
       if (currentIndex >= items.length) return;
-
       await task(items[currentIndex], currentIndex);
     }
   }
@@ -1591,13 +1365,7 @@ async function processAiBulkJob(jobId) {
     return;
   }
 
-  await supabase
-    .from("ai_jobs")
-    .update({
-      status: "processing",
-      updated_at: new Date().toISOString()
-    })
-    .eq("id", jobId);
+  await supabase.from("ai_jobs").update({ status: "processing" }).eq("id", jobId);
 
   const { data: items, error: itemsError } = await supabase
     .from("ai_job_items")
@@ -1606,17 +1374,10 @@ async function processAiBulkJob(jobId) {
     .order("created_at", { ascending: true });
 
   if (itemsError) {
-    console.error("Could not load AI job items:", itemsError);
-
     await supabase
       .from("ai_jobs")
-      .update({
-        status: "failed",
-        error_message: itemsError.message,
-        updated_at: new Date().toISOString()
-      })
+      .update({ status: "failed", error_message: itemsError.message })
       .eq("id", jobId);
-
     return;
   }
 
@@ -1624,24 +1385,16 @@ async function processAiBulkJob(jobId) {
   let failed = 0;
 
   await runWithConcurrency(items || [], AI_BULK_CONCURRENCY, async (item) => {
-    await supabase
-      .from("ai_job_items")
-      .update({
-        status: "processing",
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", item.id);
+    await supabase.from("ai_job_items").update({ status: "processing" }).eq("id", item.id);
 
     try {
       const result = await editImageWithGemini({
         originalImageUrl: item.original_image_url,
         prompt: item.prompt,
-        model: job.model || GEMINI_IMAGE_MODEL
+        model: job.model || GEMINI_IMAGE_MODEL,
       });
 
-      let savedMedia = null;
-
-      savedMedia = await insertAiGeneratedMedia({
+      const savedMedia = await insertAiGeneratedMedia({
         editedImageUrl: result.editedImageUrl,
         sourceMediaAssetId: item.original_media_asset_id,
         aiJobId: job.id,
@@ -1652,7 +1405,7 @@ async function processAiBulkJob(jobId) {
         aspectRatio: job.aspect_ratio,
         outputSize: job.output_size,
         resolution: job.resolution,
-        quality: job.quality
+        quality: job.quality,
       });
 
       await supabase
@@ -1662,7 +1415,6 @@ async function processAiBulkJob(jobId) {
           edited_image_url: result.editedImageUrl,
           result_media_asset_id: savedMedia?.id || null,
           error_message: null,
-          updated_at: new Date().toISOString()
         })
         .eq("id", item.id);
 
@@ -1677,7 +1429,6 @@ async function processAiBulkJob(jobId) {
           error_message: error.response?.data
             ? JSON.stringify(error.response.data)
             : error.message,
-          updated_at: new Date().toISOString()
         })
         .eq("id", item.id);
     }
@@ -1687,7 +1438,6 @@ async function processAiBulkJob(jobId) {
       .update({
         completed_items: completed,
         failed_items: failed,
-        updated_at: new Date().toISOString()
       })
       .eq("id", jobId);
   });
@@ -1698,92 +1448,486 @@ async function processAiBulkJob(jobId) {
       status: failed > 0 && completed === 0 ? "failed" : "completed",
       completed_items: completed,
       failed_items: failed,
-      updated_at: new Date().toISOString()
     })
     .eq("id", jobId);
 }
 
 /**
+ * META WEBHOOK HELPERS
+ */
+function verifyMetaSignature(req) {
+  if (!META_APP_SECRET) return true;
+
+  const signature = req.headers["x-hub-signature-256"];
+
+  if (!signature || !signature.startsWith("sha256=")) {
+    return false;
+  }
+
+  const expected = `sha256=${createHmac("sha256", META_APP_SECRET)
+    .update(req.rawBody || Buffer.from(""))
+    .digest("hex")}`;
+
+  const sigBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+
+  if (sigBuffer.length !== expectedBuffer.length) return false;
+
+  return timingSafeEqual(sigBuffer, expectedBuffer);
+}
+
+async function storeWebhookEvent({ body, field = null, eventType = null }) {
+  if (!supabase) return null;
+
+  const { data, error } = await supabase
+    .from("meta_webhook_events")
+    .insert({
+      object_type: body?.object || null,
+      field,
+      event_type: eventType,
+      meta_id: null,
+      payload: body,
+      processed: false,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.warn("Webhook event insert failed:", error.message);
+    return null;
+  }
+
+  return data;
+}
+
+async function upsertConversationFromMessage({ senderId, text, sentAt, raw }) {
+  requireSupabaseConfig();
+
+  if (!senderId) return null;
+
+  const { data: existing } = await supabase
+    .from("ig_conversations")
+    .select("*")
+    .eq("ig_scoped_user_id", senderId)
+    .maybeSingle();
+
+  if (existing) {
+    const { data, error } = await supabase
+      .from("ig_conversations")
+      .update({
+        last_message_text: text || existing.last_message_text,
+        last_message_at: sentAt || new Date().toISOString(),
+        unread_count: (existing.unread_count || 0) + 1,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", existing.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  }
+
+  const { data, error } = await supabase
+    .from("ig_conversations")
+    .insert({
+      platform: "instagram",
+      ig_scoped_user_id: senderId,
+      username: senderId,
+      last_message_text: text || "",
+      last_message_at: sentAt || new Date().toISOString(),
+      unread_count: 1,
+      status: "open",
+      raw,
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function insertInboundMessageFromWebhook(messagingEvent) {
+  requireSupabaseConfig();
+
+  const senderId = messagingEvent?.sender?.id;
+  const recipientId = messagingEvent?.recipient?.id;
+  const message = messagingEvent?.message || {};
+  const text = message.text || "";
+  const mid = message.mid || null;
+  const timestamp = messagingEvent?.timestamp
+    ? new Date(Number(messagingEvent.timestamp)).toISOString()
+    : new Date().toISOString();
+
+  const attachment = Array.isArray(message.attachments) ? message.attachments[0] : null;
+  const messageType = attachment?.type || (text ? "text" : "unknown");
+  const mediaUrl = attachment?.payload?.url || null;
+
+  const conversation = await upsertConversationFromMessage({
+    senderId,
+    text: text || messageType,
+    sentAt: timestamp,
+    raw: messagingEvent,
+  });
+
+  if (!conversation) return;
+
+  const { error } = await supabase.from("ig_messages").upsert(
+    {
+      conversation_id: conversation.id,
+      meta_message_id: mid,
+      ig_scoped_user_id: senderId,
+      direction: "inbound",
+      message_type: messageType,
+      text,
+      media_url: mediaUrl,
+      from_id: senderId,
+      to_id: recipientId,
+      sent_at: timestamp,
+      raw: messagingEvent,
+    },
+    { onConflict: "meta_message_id" },
+  );
+
+  if (error) {
+    console.warn("Inbound message insert failed:", error.message);
+  }
+}
+
+function autoReplyRuleMatches(rule, commentText) {
+  const text = String(commentText || "").toLowerCase().trim();
+
+  if (!rule.is_enabled) return false;
+
+  if (rule.trigger_type === "any_comment") return true;
+
+  const keywords = Array.isArray(rule.keywords)
+    ? rule.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean)
+    : [];
+
+  if (keywords.length === 0) return false;
+
+  if (rule.trigger_type === "keyword") {
+    return keywords.some((keyword) => text.includes(keyword));
+  }
+
+  if (rule.trigger_type === "exact_match") {
+    return keywords.some((keyword) => text === keyword);
+  }
+
+  return false;
+}
+
+async function sendCommentPublicReply(igCommentId, message) {
+  const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+
+  const response = await axios.post(metaUrl(`/${igCommentId}/replies`), null, {
+    params: {
+      message,
+      access_token: token,
+    },
+    timeout: 30000,
+  });
+
+  return response.data;
+}
+
+async function sendCommentPrivateReply(igCommentId, message) {
+  const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+
+  const response = await axios.post(metaUrl(`/${igCommentId}/private_replies`), null, {
+    params: {
+      message,
+      access_token: token,
+    },
+    timeout: 30000,
+  });
+
+  return response.data;
+}
+
+async function applyAutoReplyRulesToComment(commentRow) {
+  if (!AUTO_REPLY_ENABLED || !commentRow?.ig_comment_id) return;
+
+  requireSupabaseConfig();
+
+  const { data: rules, error } = await supabase
+    .from("ig_auto_reply_rules")
+    .select("*")
+    .eq("is_enabled", true);
+
+  if (error) {
+    console.warn("Could not load auto reply rules:", error.message);
+    return;
+  }
+
+  for (const rule of rules || []) {
+    if (!autoReplyRuleMatches(rule, commentRow.text)) continue;
+
+    if (rule.only_once_per_user && commentRow.user_id) {
+      const { data: existingLog } = await supabase
+        .from("ig_auto_reply_logs")
+        .select("id")
+        .eq("rule_id", rule.id)
+        .eq("user_id", commentRow.user_id)
+        .eq("status", "sent")
+        .maybeSingle();
+
+      if (existingLog) {
+        await supabase.from("ig_auto_reply_logs").insert({
+          rule_id: rule.id,
+          ig_comment_id: commentRow.ig_comment_id,
+          ig_media_id: commentRow.ig_media_id,
+          username: commentRow.username,
+          user_id: commentRow.user_id,
+          reply_mode: rule.reply_mode,
+          status: "skipped",
+          message_text: "Skipped because only_once_per_user is enabled.",
+        });
+        continue;
+      }
+    }
+
+    try {
+      if ((rule.reply_mode === "public_reply" || rule.reply_mode === "both") && rule.public_reply_text) {
+        await sendCommentPublicReply(commentRow.ig_comment_id, rule.public_reply_text);
+      }
+
+      if ((rule.reply_mode === "private_reply" || rule.reply_mode === "both") && rule.private_reply_text) {
+        await sendCommentPrivateReply(commentRow.ig_comment_id, rule.private_reply_text);
+      }
+
+      await supabase.from("ig_auto_reply_logs").insert({
+        rule_id: rule.id,
+        ig_comment_id: commentRow.ig_comment_id,
+        ig_media_id: commentRow.ig_media_id,
+        username: commentRow.username,
+        user_id: commentRow.user_id,
+        reply_mode: rule.reply_mode,
+        message_text:
+          rule.reply_mode === "public_reply"
+            ? rule.public_reply_text
+            : rule.private_reply_text || rule.public_reply_text,
+        status: "sent",
+      });
+
+      await supabase
+        .from("ig_comments")
+        .update({
+          auto_reply_rule_id: rule.id,
+          replied_by_app: rule.reply_mode === "public_reply" || rule.reply_mode === "both",
+          replied_at:
+            rule.reply_mode === "public_reply" || rule.reply_mode === "both"
+              ? new Date().toISOString()
+              : commentRow.replied_at,
+          private_replied_by_app:
+            rule.reply_mode === "private_reply" || rule.reply_mode === "both",
+          private_replied_at:
+            rule.reply_mode === "private_reply" || rule.reply_mode === "both"
+              ? new Date().toISOString()
+              : commentRow.private_replied_at,
+        })
+        .eq("ig_comment_id", commentRow.ig_comment_id);
+    } catch (replyError) {
+      await supabase.from("ig_auto_reply_logs").insert({
+        rule_id: rule.id,
+        ig_comment_id: commentRow.ig_comment_id,
+        ig_media_id: commentRow.ig_media_id,
+        username: commentRow.username,
+        user_id: commentRow.user_id,
+        reply_mode: rule.reply_mode,
+        message_text:
+          rule.reply_mode === "public_reply"
+            ? rule.public_reply_text
+            : rule.private_reply_text || rule.public_reply_text,
+        status: "failed",
+        error_message: replyError.response?.data
+          ? JSON.stringify(replyError.response.data)
+          : replyError.message,
+      });
+    }
+  }
+}
+
+async function upsertCommentFromMeta(value) {
+  requireSupabaseConfig();
+
+  const igCommentId = value.id || value.comment_id;
+  if (!igCommentId) return null;
+
+  const row = {
+    ig_comment_id: igCommentId,
+    ig_media_id: value.media_id || value.media?.id || null,
+    parent_comment_id: value.parent_id || value.parent_comment_id || null,
+    username: value.from?.username || value.username || null,
+    user_id: value.from?.id || value.user_id || null,
+    text: value.text || value.message || "",
+    like_count: Number(value.like_count || 0),
+    timestamp: value.timestamp ? new Date(value.timestamp).toISOString() : new Date().toISOString(),
+    is_reply: Boolean(value.parent_id || value.parent_comment_id),
+    raw: value,
+  };
+
+  const { data, error } = await supabase
+    .from("ig_comments")
+    .upsert(row, { onConflict: "ig_comment_id" })
+    .select()
+    .single();
+
+  if (error) {
+    console.warn("Comment upsert failed:", error.message);
+    return null;
+  }
+
+  await applyAutoReplyRulesToComment(data);
+  return data;
+}
+
+/**
  * ROOT / HEALTH
  */
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({
     ok: true,
     app: "AutoFlow Backend",
     status: "running",
-    graphHost: GRAPH_HOST,
     graphVersion: GRAPH_VERSION,
-    cloudinaryConfigured: Boolean(
-      CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
-    ),
+    cloudinaryConfigured: Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET),
     supabaseConfigured: Boolean(supabase),
-    aiStudio: true
+    aiStudio: true,
+    inboxEnabled: Boolean(FACEBOOK_PAGE_ID && FACEBOOK_PAGE_ACCESS_TOKEN),
+    commentsEnabled: Boolean(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN),
+    webhooksEnabled: Boolean(META_WEBHOOK_VERIFY_TOKEN),
   });
 });
 
-app.get("/api/health", (req, res) => {
+app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     timestamp: new Date().toISOString(),
-    graphHost: GRAPH_HOST,
     graphVersion: GRAPH_VERSION,
-    cloudinaryConfigured: Boolean(
-      CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
-    ),
+    cloudinaryConfigured: Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET),
     supabaseConfigured: Boolean(supabase),
-    aiStudio: true
+    aiStudio: true,
+    inboxEnabled: Boolean(FACEBOOK_PAGE_ID && FACEBOOK_PAGE_ACCESS_TOKEN),
+    commentsEnabled: Boolean(META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN),
+    webhooksEnabled: Boolean(META_WEBHOOK_VERIFY_TOKEN),
   });
+});
+
+/**
+ * WEBHOOKS
+ */
+app.get("/api/webhooks/meta", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === META_WEBHOOK_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.status(403).send("Invalid verify token");
+});
+
+app.post("/api/webhooks/meta", async (req, res) => {
+  try {
+    if (!verifyMetaSignature(req)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Invalid Meta signature.",
+      });
+    }
+
+    const body = req.body;
+    const event = await storeWebhookEvent({ body, field: null, eventType: "webhook" });
+
+    for (const entry of body.entry || []) {
+      for (const messagingEvent of entry.messaging || []) {
+        await insertInboundMessageFromWebhook(messagingEvent);
+      }
+
+      for (const change of entry.changes || []) {
+        if (change.field && String(change.field).includes("comment")) {
+          await upsertCommentFromMeta(change.value || {});
+        }
+
+        if (change.field && String(change.field).includes("message")) {
+          await storeWebhookEvent({
+            body: change,
+            field: change.field,
+            eventType: "message_change",
+          });
+        }
+      }
+    }
+
+    if (event?.id) {
+      await supabase
+        ?.from("meta_webhook_events")
+        .update({ processed: true })
+        .eq("id", event.id);
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Webhook processing failed:", error.response?.data || error.message);
+    return res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message,
+    });
+  }
 });
 
 /**
  * META TEST
  */
 async function testMetaConnection() {
-  requireMetaConfig();
+  requireMetaPublishConfig();
 
-  const response = await axios.get(`${GRAPH_HOST}/${GRAPH_VERSION}/me`, {
+  const response = await axios.get(igUrl("/me"), {
     params: {
       fields: "user_id,username",
-      access_token: META_ACCESS_TOKEN
+      access_token: META_ACCESS_TOKEN,
     },
-    timeout: 30000
+    timeout: 30000,
   });
 
   return {
     account: response.data,
     configuredIgUserId: IG_USER_ID,
     idMatches: String(response.data.user_id) === String(IG_USER_ID),
-    graphHost: GRAPH_HOST,
-    graphVersion: GRAPH_VERSION
+    graphHost: IG_GRAPH_HOST,
+    graphVersion: GRAPH_VERSION,
   };
 }
 
-app.get("/api/meta/test-connection", async (req, res) => {
+app.get("/api/meta/test-connection", async (_req, res) => {
   try {
     const result = await testMetaConnection();
     res.json({ ok: true, ...result });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
 
-app.post("/api/meta/test-connection", async (req, res) => {
+app.post("/api/meta/test-connection", async (_req, res) => {
   try {
     const result = await testMetaConnection();
     res.json({ ok: true, ...result });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
 
 /**
- * MEDIA UPLOAD / LIBRARY
+ * MEDIA
  */
 app.post("/api/upload", upload.any(), async (req, res) => {
   try {
@@ -1795,7 +1939,7 @@ app.post("/api/upload", upload.any(), async (req, res) => {
     if (!file) {
       return res.status(400).json({
         ok: false,
-        error: "No media file uploaded. Send multipart/form-data with any file field."
+        error: "No media file uploaded.",
       });
     }
 
@@ -1805,17 +1949,11 @@ app.post("/api/upload", upload.any(), async (req, res) => {
       cleanupFile(file.path);
       return res.status(400).json({
         ok: false,
-        error: "Unsupported file type. Upload image or video only."
+        error: "Unsupported file type. Upload image or video only.",
       });
     }
 
-    let uploaded;
-
-    if (mediaType === "image") {
-      uploaded = await uploadNormalizedImage(file);
-    } else {
-      uploaded = await uploadVideo(file);
-    }
+    const uploaded = mediaType === "image" ? await uploadNormalizedImage(file) : await uploadVideo(file);
 
     const { data: media, error } = await supabase
       .from("media_assets")
@@ -1828,7 +1966,7 @@ app.post("/api/upload", upload.any(), async (req, res) => {
         file_name: file.originalname || null,
         is_uploaded: true,
         is_scheduled: false,
-        is_published: false
+        is_published: false,
       })
       .select()
       .single();
@@ -1837,7 +1975,7 @@ app.post("/api/upload", upload.any(), async (req, res) => {
 
     res.json({
       ok: true,
-      media,
+      media: withAliases(media),
       url: uploaded.mediaUrl,
       mediaUrl: uploaded.mediaUrl,
       media_url: uploaded.mediaUrl,
@@ -1848,7 +1986,7 @@ app.post("/api/upload", upload.any(), async (req, res) => {
       mediaType: uploaded.mediaType,
       media_type: uploaded.mediaType,
       mimeType: uploaded.mimeType,
-      mime_type: uploaded.mimeType
+      mime_type: uploaded.mimeType,
     });
   } catch (error) {
     console.error("Upload failed:", error.response?.data || error.message);
@@ -1859,12 +1997,12 @@ app.post("/api/upload", upload.any(), async (req, res) => {
 
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
 
-app.get("/api/media", async (req, res) => {
+app.get("/api/media", async (_req, res) => {
   try {
     requireSupabaseConfig();
 
@@ -1877,13 +2015,10 @@ app.get("/api/media", async (req, res) => {
 
     res.json({
       ok: true,
-      media: data || []
+      media: (data || []).map(withAliases),
     });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -1898,61 +2033,9 @@ app.delete("/api/media/:id", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      deleted: true
-    });
+    res.json({ ok: true, deleted: true });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * DEBUG URL
- */
-app.post("/api/debug/inspect-url", async (req, res) => {
-  try {
-    const url = req.body.url;
-
-    if (!url || !isPublicHttpsUrl(url)) {
-      return res.status(400).json({
-        ok: false,
-        error: "url must be a public HTTPS URL."
-      });
-    }
-
-    let response;
-
-    try {
-      response = await axios.head(url, {
-        maxRedirects: 5,
-        timeout: 30000,
-        validateStatus: () => true
-      });
-    } catch {
-      response = await axios.get(url, {
-        maxRedirects: 5,
-        timeout: 30000,
-        responseType: "stream",
-        validateStatus: () => true
-      });
-    }
-
-    res.json({
-      ok: true,
-      status: response.status,
-      contentType: response.headers["content-type"] || null,
-      contentLength: response.headers["content-length"] || null,
-      finalUrl: response.request?.res?.responseUrl || url
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -1964,249 +2047,31 @@ app.post("/api/meta/publish-now", async (req, res) => {
     const { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
       normalizeMediaInput(req.body);
 
-    const caption =
-      req.body.caption || req.body.final_text || req.body.finalText || "";
+    const caption = req.body.caption || req.body.final_text || req.body.finalText || "";
 
     const result = await publishToInstagram({
       mediaUrl,
       imageUrl,
       videoUrl,
       mediaType,
-      caption
+      caption,
     });
 
     if (mediaAssetId && isValidUuid(mediaAssetId)) {
       await markMediaPublished(mediaAssetId, new Date().toISOString());
     }
 
-    res.json({
-      ok: true,
-      result
-    });
+    res.json({ ok: true, result });
   } catch (error) {
-    const metaError = error.response?.data || error.message;
-
     res.status(500).json({
       ok: false,
-      error: metaError,
-      friendlyMessage:
-        error.response?.data?.error?.code === 9004
-          ? "Meta could not fetch this media URL. Re-upload the file and make sure Cloudinary URL is used."
-          : error.response?.data?.error?.code === 9007
-            ? "Meta media was not ready. Backend waited and retried but Meta still rejected it."
-            : undefined
+      error: error.response?.data || error.message,
     });
   }
 });
 
 /**
- * AI MODELS
- */
-async function listModelsHandler(req, res, forcedProvider = null) {
-  try {
-    const provider = normalizeProvider(forcedProvider || req.body.provider);
-    const apiKey = getProviderApiKey({
-      provider,
-      apiKey: req.body.apiKey
-    });
-
-    if (!apiKey) {
-      return res.status(400).json({
-        ok: false,
-        error: `Missing API key for provider: ${provider}`
-      });
-    }
-
-    let normalizedModels = [];
-
-    if (provider === "gemini") {
-      const response = await axios.get(
-        "https://generativelanguage.googleapis.com/v1beta/models",
-        {
-          params: { key: apiKey },
-          timeout: 30000
-        }
-      );
-
-      normalizedModels = (response.data.models || []).map((model) => {
-        const id = String(model.name || "").replace("models/", "");
-        return classifyModel("gemini", id, model);
-      });
-    }
-
-    if (provider === "openai") {
-      const response = await axios.get("https://api.openai.com/v1/models", {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        timeout: 30000
-      });
-
-      normalizedModels = (response.data.data || []).map((model) =>
-        classifyModel("openai", model.id, {
-          name: model.id,
-          displayName: model.id
-        })
-      );
-    }
-
-    if (provider === "openrouter") {
-      const response = await axios.get("https://openrouter.ai/api/v1/models", {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        timeout: 30000
-      });
-
-      normalizedModels = (response.data.data || []).map((model) =>
-        classifyModel("openrouter", model.id, {
-          name: model.id,
-          displayName: model.name || model.id,
-          description: model.description || "",
-          pricing: model.pricing || {}
-        })
-      );
-    }
-
-    res.json({
-      ok: true,
-      provider,
-      models: normalizedModels,
-      textModels: normalizedModels.filter((m) => m.supportsText).map((m) => m.id),
-      imageModels: normalizedModels.filter((m) => m.supportsImage).map((m) => m.id),
-      videoModels: normalizedModels.filter((m) => m.supportsVideo).map((m) => m.id),
-      freeModels: normalizedModels.filter((m) => m.isFree).map((m) => m.id)
-    });
-  } catch (error) {
-    console.error("AI list models failed:", error.response?.data || error.message);
-
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message
-    });
-  }
-}
-
-app.post("/api/ai/list-models", (req, res) => listModelsHandler(req, res));
-app.post("/api/gemini/list-models", (req, res) =>
-  listModelsHandler(req, res, "gemini")
-);
-
-app.post("/api/ai/test-model", async (req, res) => {
-  try {
-    const provider = normalizeProvider(req.body.provider);
-    const model = String(req.body.model || "").trim();
-
-    const apiKey = getProviderApiKey({
-      provider,
-      apiKey: req.body.apiKey
-    });
-
-    if (!apiKey) {
-      return res.status(400).json({
-        ok: false,
-        error: `Missing API key for provider: ${provider}`
-      });
-    }
-
-    if (!model) {
-      return res.status(400).json({
-        ok: false,
-        error: "model is required."
-      });
-    }
-
-    if (provider === "gemini") {
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        {
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: 'Return strict JSON only: {"ok": true, "message": "AI connected"}'
-                }
-              ]
-            }
-          ]
-        },
-        {
-          params: { key: apiKey },
-          headers: { "Content-Type": "application/json" },
-          timeout: 60000
-        }
-      );
-
-      return res.json({
-        ok: true,
-        provider,
-        model,
-        raw: response.data
-      });
-    }
-
-    const endpoint =
-      provider === "openrouter"
-        ? "https://openrouter.ai/api/v1/chat/completions"
-        : "https://api.openai.com/v1/chat/completions";
-
-    const response = await axios.post(
-      endpoint,
-      {
-        model,
-        messages: [
-          {
-            role: "user",
-            content:
-              'Return strict JSON only: {"ok": true, "message": "AI connected"}'
-          }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        timeout: 60000
-      }
-    );
-
-    res.json({
-      ok: true,
-      provider,
-      model,
-      raw: response.data
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message
-    });
-  }
-});
-
-app.post("/api/gemini/test", async (req, res) => {
-  try {
-    const model = req.body.model || GEMINI_TEXT_MODEL;
-
-    const text = await generateTextWithGemini(
-      'Return strict JSON only: {"ok": true, "message": "Gemini connected"}',
-      model
-    );
-
-    res.json({
-      ok: true,
-      raw: text,
-      result: parseJsonLoose(text) || { message: text },
-      model
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message
-    });
-  }
-});
-
-/**
- * CAPTION / EDIT PROMPT / IMAGE EDIT
+ * CAPTION
  */
 app.post("/api/gemini/generate-caption", async (req, res) => {
   try {
@@ -2217,7 +2082,7 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
     if (!imageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "imageUrl or mediaUrl is required."
+        error: "imageUrl or mediaUrl is required.",
       });
     }
 
@@ -2228,13 +2093,22 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
       language: req.body.language || "arabic",
       tone: req.body.tone || "premium",
       model: req.body.model || GEMINI_TEXT_MODEL,
-      captionPreset: req.body.captionPreset || req.body.caption_preset || "Luxury Product Caption",
+      captionPreset:
+        req.body.captionPreset ||
+        req.body.caption_preset ||
+        "Luxury Product Caption",
       customPrompt: req.body.customPrompt || req.body.custom_prompt || "",
-      businessName: req.body.businessName || req.body.business_name || DEFAULT_BUSINESS_NAME,
+      businessName:
+        req.body.businessName ||
+        req.body.business_name ||
+        DEFAULT_BUSINESS_NAME,
       location: req.body.location || DEFAULT_LOCATION,
       cta: req.body.cta || DEFAULT_CTA,
-      hashtagCount: req.body.hashtagCount || req.body.hashtag_count || DEFAULT_HASHTAG_COUNT,
-      fallbackTextOnly: req.body.fallbackTextOnly === true
+      hashtagCount:
+        req.body.hashtagCount ||
+        req.body.hashtag_count ||
+        DEFAULT_HASHTAG_COUNT,
+      fallbackTextOnly: req.body.fallbackTextOnly === true,
     });
 
     const mediaAssetId = req.body.mediaAssetId || req.body.media_asset_id;
@@ -2245,30 +2119,25 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
         .update({
           caption: result.caption,
           hashtags: result.hashtags,
-          updated_at: new Date().toISOString()
+          updated_at: new Date().toISOString(),
         })
         .eq("id", mediaAssetId);
     }
 
-    res.json({
-      ok: true,
-      result
-    });
+    res.json({ ok: true, result });
   } catch (error) {
     console.error("Generate caption failed:", error.response?.data || error.message);
 
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
 
-app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
-  req.url = "/api/ai/generate-edit-prompt";
-  app.handle(req, res);
-});
-
+/**
+ * AI STUDIO
+ */
 app.post("/api/ai/generate-edit-prompt", async (req, res) => {
   try {
     const imageUrl =
@@ -2278,23 +2147,9 @@ app.post("/api/ai/generate-edit-prompt", async (req, res) => {
     if (!imageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "imageUrl or mediaUrl is required."
+        error: "imageUrl or mediaUrl is required.",
       });
     }
-
-    const provider = normalizeProvider(req.body.provider || "gemini");
-
-    if (provider !== "gemini") {
-      return res.status(400).json({
-        ok: false,
-        error: "AI edit prompt generation currently supports Gemini provider only."
-      });
-    }
-
-    const apiKey = getProviderApiKey({
-      provider,
-      apiKey: req.body.apiKey
-    });
 
     const result = await generateEditPromptWithGemini({
       imageUrl,
@@ -2305,21 +2160,21 @@ app.post("/api/ai/generate-edit-prompt", async (req, res) => {
       language: req.body.language || "english",
       customPrompt: req.body.customPrompt || req.body.custom_prompt || "",
       model: req.body.model || GEMINI_TEXT_MODEL,
-      apiKey
+      apiKey: GEMINI_API_KEY,
     });
 
-    res.json({
-      ok: true,
-      result
-    });
+    res.json({ ok: true, result });
   } catch (error) {
-    console.error("Generate edit prompt failed:", error.response?.data || error.message);
-
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
+});
+
+app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
+  req.url = "/api/ai/generate-edit-prompt";
+  app.handle(req, res);
 });
 
 app.post("/api/ai/edit-image", async (req, res) => {
@@ -2334,38 +2189,26 @@ app.post("/api/ai/edit-image", async (req, res) => {
     if (!originalImageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "originalImageUrl is required."
-      });
-    }
-
-    const provider = normalizeProvider(req.body.provider || "gemini");
-
-    if (provider !== "gemini") {
-      return res.status(400).json({
-        ok: false,
-        error: "AI image editing currently supports Gemini provider only."
+        error: "originalImageUrl is required.",
       });
     }
 
     const model = req.body.model || GEMINI_IMAGE_MODEL;
     const mediaAssetId = req.body.mediaAssetId || req.body.media_asset_id || null;
-
     const editMode = req.body.editMode || req.body.edit_mode || "background_only";
     const aspectRatio = req.body.aspectRatio || req.body.aspect_ratio || "4:5";
     const outputSize = req.body.outputSize || req.body.output_size || "1080x1350";
     const resolution = Number(req.body.resolution || 1080);
     const quality = req.body.quality || "high";
     const backgroundIntensity =
-      req.body.backgroundIntensity || req.body.background_intensity || "medium";
+      req.body.backgroundIntensity ||
+      req.body.background_intensity ||
+      "medium";
     const saveToLibrary = req.body.saveToLibrary !== false;
-
     const userPrompt = req.body.prompt || req.body.ai_edit_prompt || "";
 
     if (!userPrompt) {
-      return res.status(400).json({
-        ok: false,
-        error: "prompt is required."
-      });
+      return res.status(400).json({ ok: false, error: "prompt is required." });
     }
 
     const finalPrompt = buildAiEditPrompt({
@@ -2379,7 +2222,7 @@ app.post("/api/ai/edit-image", async (req, res) => {
       resolution,
       quality,
       backgroundIntensity,
-      userPrompt
+      userPrompt,
     });
 
     const { data: job, error: jobError } = await supabase
@@ -2390,13 +2233,13 @@ app.post("/api/ai/edit-image", async (req, res) => {
         total_items: 1,
         completed_items: 0,
         failed_items: 0,
-        provider,
+        provider: "gemini",
         model,
         edit_mode: editMode,
         aspect_ratio: aspectRatio,
         output_size: outputSize,
         resolution,
-        quality
+        quality,
       })
       .select()
       .single();
@@ -2410,7 +2253,7 @@ app.post("/api/ai/edit-image", async (req, res) => {
         original_media_asset_id: isValidUuid(mediaAssetId) ? mediaAssetId : null,
         original_image_url: originalImageUrl,
         prompt: finalPrompt,
-        status: "processing"
+        status: "processing",
       })
       .select()
       .single();
@@ -2421,7 +2264,7 @@ app.post("/api/ai/edit-image", async (req, res) => {
       const result = await editImageWithGemini({
         originalImageUrl,
         prompt: finalPrompt,
-        model
+        model,
       });
 
       let savedMedia = null;
@@ -2433,12 +2276,12 @@ app.post("/api/ai/edit-image", async (req, res) => {
           aiJobId: job.id,
           prompt: finalPrompt,
           editMode,
-          provider,
+          provider: "gemini",
           model,
           aspectRatio,
           outputSize,
           resolution,
-          quality
+          quality,
         });
       }
 
@@ -2448,7 +2291,6 @@ app.post("/api/ai/edit-image", async (req, res) => {
           status: "completed",
           edited_image_url: result.editedImageUrl,
           result_media_asset_id: savedMedia?.id || null,
-          updated_at: new Date().toISOString()
         })
         .eq("id", jobItem.id);
 
@@ -2458,7 +2300,6 @@ app.post("/api/ai/edit-image", async (req, res) => {
           status: "completed",
           completed_items: 1,
           failed_items: 0,
-          updated_at: new Date().toISOString()
         })
         .eq("id", job.id);
 
@@ -2471,8 +2312,8 @@ app.post("/api/ai/edit-image", async (req, res) => {
           prompt: finalPrompt,
           status: "completed",
           savedMediaAssetId: savedMedia?.id || null,
-          media: savedMedia
-        }
+          media: savedMedia ? withAliases(savedMedia) : null,
+        },
       });
     } catch (error) {
       await supabase
@@ -2482,7 +2323,6 @@ app.post("/api/ai/edit-image", async (req, res) => {
           error_message: error.response?.data
             ? JSON.stringify(error.response.data)
             : error.message,
-          updated_at: new Date().toISOString()
         })
         .eq("id", jobItem.id);
 
@@ -2494,18 +2334,15 @@ app.post("/api/ai/edit-image", async (req, res) => {
           error_message: error.response?.data
             ? JSON.stringify(error.response.data)
             : error.message,
-          updated_at: new Date().toISOString()
         })
         .eq("id", job.id);
 
       throw error;
     }
   } catch (error) {
-    console.error("AI edit image failed:", error.response?.data || error.message);
-
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
@@ -2520,16 +2357,7 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
     if (items.length === 0) {
       return res.status(400).json({
         ok: false,
-        error: "items must be a non-empty array."
-      });
-    }
-
-    const provider = normalizeProvider(commonOptions.provider || req.body.provider || "gemini");
-
-    if (provider !== "gemini") {
-      return res.status(400).json({
-        ok: false,
-        error: "AI bulk image editing currently supports Gemini provider only."
+        error: "items must be a non-empty array.",
       });
     }
 
@@ -2548,13 +2376,13 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
         total_items: items.length,
         completed_items: 0,
         failed_items: 0,
-        provider,
+        provider: "gemini",
         model,
         edit_mode: editMode,
         aspect_ratio: aspectRatio,
         output_size: outputSize,
         resolution,
-        quality
+        quality,
       })
       .select()
       .single();
@@ -2571,7 +2399,6 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
         item.media_url;
 
       const mediaAssetId = item.mediaAssetId || item.media_asset_id || null;
-
       const rawPrompt = item.prompt || commonOptions.prompt || "";
 
       const finalPrompt = buildAiEditPrompt({
@@ -2588,7 +2415,7 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
           item.backgroundIntensity ||
           commonOptions.backgroundIntensity ||
           "medium",
-        userPrompt: rawPrompt
+        userPrompt: rawPrompt,
       });
 
       return {
@@ -2596,7 +2423,7 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
         original_media_asset_id: isValidUuid(mediaAssetId) ? mediaAssetId : null,
         original_image_url: originalImageUrl,
         prompt: finalPrompt,
-        status: "pending"
+        status: "pending",
       };
     });
 
@@ -2605,7 +2432,7 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
     if (invalid) {
       return res.status(400).json({
         ok: false,
-        error: "Every item must include originalImageUrl, imageUrl, or mediaUrl."
+        error: "Every item must include originalImageUrl, imageUrl, or mediaUrl.",
       });
     }
 
@@ -2627,20 +2454,18 @@ app.post("/api/ai/bulk-edit", async (req, res) => {
         id: job.id,
         status: "processing",
         totalItems: items.length,
-        total_items: items.length
-      }
+        total_items: items.length,
+      },
     });
   } catch (error) {
-    console.error("AI bulk edit failed:", error.response?.data || error.message);
-
     res.status(500).json({
       ok: false,
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
 
-app.get("/api/ai/jobs", async (req, res) => {
+app.get("/api/ai/jobs", async (_req, res) => {
   try {
     requireSupabaseConfig();
 
@@ -2651,15 +2476,9 @@ app.get("/api/ai/jobs", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      jobs: data || []
-    });
+    res.json({ ok: true, jobs: data || [] });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -2683,20 +2502,13 @@ app.get("/api/ai/jobs/:id", async (req, res) => {
 
     if (itemsError) throw itemsError;
 
-    res.json({
-      ok: true,
-      job,
-      items: items || []
-    });
+    res.json({ ok: true, job, items: items || [] });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-app.get("/api/ai/results", async (req, res) => {
+app.get("/api/ai/results", async (_req, res) => {
   try {
     requireSupabaseConfig();
 
@@ -2708,15 +2520,9 @@ app.get("/api/ai/results", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      results: data || []
-    });
+    res.json({ ok: true, results: (data || []).map(withAliases) });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -2735,7 +2541,7 @@ app.post("/api/ai/save-result", async (req, res) => {
     if (!editedImageUrl || !isPublicHttpsUrl(editedImageUrl)) {
       return res.status(400).json({
         ok: false,
-        error: "editedImageUrl must be a public HTTPS URL."
+        error: "editedImageUrl must be a public HTTPS URL.",
       });
     }
 
@@ -2751,18 +2557,12 @@ app.post("/api/ai/save-result", async (req, res) => {
       aspectRatio: req.body.aspectRatio || req.body.aspect_ratio || null,
       outputSize: req.body.outputSize || req.body.output_size || null,
       resolution: req.body.resolution || null,
-      quality: req.body.quality || null
+      quality: req.body.quality || null,
     });
 
-    res.json({
-      ok: true,
-      media
-    });
+    res.json({ ok: true, media: withAliases(media) });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message
-    });
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
   }
 });
 
@@ -2778,15 +2578,653 @@ app.delete("/api/ai/results/:id", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      deleted: true
-    });
+    res.json({ ok: true, deleted: true });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/**
+ * INBOX / CHATS
+ */
+app.get("/api/inbox/conversations", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    let query = supabase
+      .from("ig_conversations")
+      .select("*")
+      .order("last_message_at", { ascending: false, nullsFirst: false });
+
+    if (req.query.status) {
+      query = query.eq("status", req.query.status);
+    }
+
+    if (req.query.search) {
+      const search = `%${req.query.search}%`;
+      query = query.or(`username.ilike.${search},last_message_text.ilike.${search}`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    res.json({ ok: true, conversations: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/inbox/sync-conversations", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+    requirePageMessagingConfig();
+
+    const response = await axios.get(metaUrl(`/${FACEBOOK_PAGE_ID}/conversations`), {
+      params: {
+        platform: "instagram",
+        fields: "id,updated_time,participants,messages.limit(1){id,message,from,to,created_time}",
+        access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+      },
+      timeout: 30000,
     });
+
+    const synced = [];
+
+    for (const conv of response.data?.data || []) {
+      const participant = conv.participants?.data?.find(
+        (p) => String(p.id) !== String(FACEBOOK_PAGE_ID),
+      );
+
+      const lastMessage = conv.messages?.data?.[0];
+
+      const { data, error } = await supabase
+        .from("ig_conversations")
+        .upsert(
+          {
+            platform: "instagram",
+            meta_conversation_id: conv.id,
+            ig_scoped_user_id: participant?.id || null,
+            username: participant?.name || participant?.username || participant?.id || null,
+            last_message_text: lastMessage?.message || "",
+            last_message_at: lastMessage?.created_time || conv.updated_time || new Date().toISOString(),
+            raw: conv,
+          },
+          { onConflict: "meta_conversation_id" },
+        )
+        .select()
+        .single();
+
+      if (!error) synced.push(data);
+    }
+
+    res.json({ ok: true, conversations: synced });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data: conversation, error: convError } = await supabase
+      .from("ig_conversations")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (convError) throw convError;
+
+    if (req.query.sync === "true" && conversation.meta_conversation_id && FACEBOOK_PAGE_ACCESS_TOKEN) {
+      const response = await axios.get(metaUrl(`/${conversation.meta_conversation_id}/messages`), {
+        params: {
+          fields: "id,message,from,to,created_time,attachments",
+          access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+        },
+        timeout: 30000,
+      });
+
+      for (const msg of response.data?.data || []) {
+        const fromId = msg.from?.id || null;
+        const direction =
+          String(fromId) === String(FACEBOOK_PAGE_ID) ? "outbound" : "inbound";
+        const attachment = msg.attachments?.data?.[0] || null;
+
+        await supabase.from("ig_messages").upsert(
+          {
+            conversation_id: conversation.id,
+            meta_message_id: msg.id,
+            meta_conversation_id: conversation.meta_conversation_id,
+            ig_scoped_user_id: conversation.ig_scoped_user_id,
+            direction,
+            message_type: attachment ? attachment.type || "unknown" : "text",
+            text: msg.message || "",
+            media_url: attachment?.payload?.url || null,
+            from_id: fromId,
+            to_id: msg.to?.data?.[0]?.id || null,
+            sent_at: msg.created_time || new Date().toISOString(),
+            raw: msg,
+          },
+          { onConflict: "meta_message_id" },
+        );
+      }
+    }
+
+    const { data, error } = await supabase
+      .from("ig_messages")
+      .select("*")
+      .eq("conversation_id", req.params.id)
+      .order("sent_at", { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ ok: true, conversation, messages: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.post("/api/inbox/send-text", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+    requirePageMessagingConfig();
+
+    const { conversationId, recipientId, text } = req.body;
+
+    if (!recipientId || !text) {
+      return res.status(400).json({
+        ok: false,
+        error: "recipientId and text are required.",
+      });
+    }
+
+    const response = await axios.post(
+      metaUrl(`/${FACEBOOK_PAGE_ID}/messages`),
+      {
+        recipient: { id: recipientId },
+        messaging_type: "RESPONSE",
+        message: { text },
+      },
+      {
+        params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
+        timeout: 30000,
+      },
+    );
+
+    if (conversationId && isValidUuid(conversationId)) {
+      await supabase.from("ig_messages").insert({
+        conversation_id: conversationId,
+        meta_message_id: response.data?.message_id || null,
+        ig_scoped_user_id: recipientId,
+        direction: "outbound",
+        message_type: "text",
+        text,
+        from_id: FACEBOOK_PAGE_ID,
+        to_id: recipientId,
+        sent_at: new Date().toISOString(),
+        raw: response.data,
+      });
+
+      await supabase
+        .from("ig_conversations")
+        .update({
+          last_message_text: text,
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", conversationId);
+    }
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.post("/api/inbox/send-image", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+    requirePageMessagingConfig();
+
+    const { conversationId, recipientId, imageUrl } = req.body;
+
+    if (!recipientId || !imageUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "recipientId and imageUrl are required.",
+      });
+    }
+
+    const response = await axios.post(
+      metaUrl(`/${FACEBOOK_PAGE_ID}/messages`),
+      {
+        recipient: { id: recipientId },
+        messaging_type: "RESPONSE",
+        message: {
+          attachment: {
+            type: "image",
+            payload: {
+              url: imageUrl,
+              is_reusable: true,
+            },
+          },
+        },
+      },
+      {
+        params: { access_token: FACEBOOK_PAGE_ACCESS_TOKEN },
+        timeout: 30000,
+      },
+    );
+
+    if (conversationId && isValidUuid(conversationId)) {
+      await supabase.from("ig_messages").insert({
+        conversation_id: conversationId,
+        meta_message_id: response.data?.message_id || null,
+        ig_scoped_user_id: recipientId,
+        direction: "outbound",
+        message_type: "image",
+        media_url: imageUrl,
+        from_id: FACEBOOK_PAGE_ID,
+        to_id: recipientId,
+        sent_at: new Date().toISOString(),
+        raw: response.data,
+      });
+
+      await supabase
+        .from("ig_conversations")
+        .update({
+          last_message_text: "[image]",
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", conversationId);
+    }
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+/**
+ * COMMENTS
+ */
+app.post("/api/comments/sync-media", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+
+    if (!IG_USER_ID || !token) {
+      return res.status(400).json({
+        ok: false,
+        error: "IG_USER_ID and access token are required.",
+      });
+    }
+
+    const response = await axios.get(metaUrl(`/${IG_USER_ID}/media`), {
+      params: {
+        fields: "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
+        access_token: token,
+      },
+      timeout: 30000,
+    });
+
+    const saved = [];
+
+    for (const media of response.data?.data || []) {
+      const { data, error } = await supabase
+        .from("ig_media_cache")
+        .upsert(
+          {
+            ig_media_id: media.id,
+            caption: media.caption || null,
+            media_type: media.media_type || null,
+            media_url: media.media_url || null,
+            permalink: media.permalink || null,
+            thumbnail_url: media.thumbnail_url || null,
+            timestamp: media.timestamp || null,
+            comments_count: media.comments_count || 0,
+            raw: media,
+          },
+          { onConflict: "ig_media_id" },
+        )
+        .select()
+        .single();
+
+      if (!error) saved.push(data);
+    }
+
+    res.json({ ok: true, media: saved });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.get("/api/comments/media", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("ig_media_cache")
+      .select("*")
+      .order("timestamp", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ ok: true, media: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/comments/sync", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const igMediaId = req.body.igMediaId || req.body.ig_media_id;
+
+    if (!igMediaId) {
+      return res.status(400).json({ ok: false, error: "igMediaId is required." });
+    }
+
+    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+
+    const response = await axios.get(metaUrl(`/${igMediaId}/comments`), {
+      params: {
+        fields: "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}",
+        access_token: token,
+      },
+      timeout: 30000,
+    });
+
+    const saved = [];
+
+    for (const comment of response.data?.data || []) {
+      const savedComment = await upsertCommentFromMeta({
+        ...comment,
+        media_id: igMediaId,
+      });
+
+      if (savedComment) saved.push(savedComment);
+
+      for (const reply of comment.replies?.data || []) {
+        const savedReply = await upsertCommentFromMeta({
+          ...reply,
+          media_id: igMediaId,
+          parent_id: comment.id,
+        });
+        if (savedReply) saved.push(savedReply);
+      }
+    }
+
+    res.json({ ok: true, comments: saved });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.get("/api/comments", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    let query = supabase
+      .from("ig_comments")
+      .select("*")
+      .order("timestamp", { ascending: false });
+
+    if (req.query.igMediaId) {
+      query = query.eq("ig_media_id", req.query.igMediaId);
+    }
+
+    if (req.query.unreplied === "true") {
+      query = query.eq("replied_by_app", false).eq("private_replied_by_app", false);
+    }
+
+    if (req.query.search) {
+      const search = `%${req.query.search}%`;
+      query = query.or(`username.ilike.${search},text.ilike.${search}`);
+    }
+
+    if (req.query.limit) {
+      query = query.limit(Number(req.query.limit));
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    res.json({ ok: true, comments: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/comments/:commentId/reply", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const message = req.body.message;
+
+    if (!message) {
+      return res.status(400).json({ ok: false, error: "message is required." });
+    }
+
+    const result = await sendCommentPublicReply(req.params.commentId, message);
+
+    await supabase
+      .from("ig_comments")
+      .update({
+        replied_by_app: true,
+        replied_at: new Date().toISOString(),
+      })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.post("/api/comments/:commentId/private-reply", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const message = req.body.message;
+
+    if (!message) {
+      return res.status(400).json({ ok: false, error: "message is required." });
+    }
+
+    const result = await sendCommentPrivateReply(req.params.commentId, message);
+
+    await supabase
+      .from("ig_comments")
+      .update({
+        private_replied_by_app: true,
+        private_replied_at: new Date().toISOString(),
+      })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.post("/api/comments/:commentId/like", async (req, res) => {
+  try {
+    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+
+    const response = await axios.post(metaUrl(`/${req.params.commentId}/likes`), null, {
+      params: { access_token: token },
+      timeout: 30000,
+    });
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      unsupported: true,
+      error:
+        error.response?.data ||
+        "Instagram comment like is not supported by this API/token.",
+    });
+  }
+});
+
+app.post("/api/comments/:commentId/hide", async (req, res) => {
+  try {
+    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+    const hide = req.body.hide !== false;
+
+    const response = await axios.post(metaUrl(`/${req.params.commentId}`), null, {
+      params: {
+        hide,
+        access_token: token,
+      },
+      timeout: 30000,
+    });
+
+    await supabase
+      ?.from("ig_comments")
+      .update({ is_hidden: hide })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+app.delete("/api/comments/:commentId", async (req, res) => {
+  try {
+    const token = META_ACCESS_TOKEN || FACEBOOK_PAGE_ACCESS_TOKEN;
+
+    const response = await axios.delete(metaUrl(`/${req.params.commentId}`), {
+      params: { access_token: token },
+      timeout: 30000,
+    });
+
+    await supabase
+      ?.from("ig_comments")
+      .update({ is_deleted: true })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+/**
+ * AUTO REPLY RULES
+ */
+app.get("/api/comments/auto-reply/rules", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("ig_auto_reply_rules")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ ok: true, rules: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/comments/auto-reply/rules", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const body = req.body;
+
+    const { data, error } = await supabase
+      .from("ig_auto_reply_rules")
+      .insert({
+        name: body.name,
+        is_enabled: body.isEnabled ?? body.is_enabled ?? false,
+        trigger_type: body.triggerType || body.trigger_type || "any_comment",
+        keywords: Array.isArray(body.keywords) ? body.keywords : [],
+        reply_mode: body.replyMode || body.reply_mode || "private_reply",
+        public_reply_text: body.publicReplyText || body.public_reply_text || null,
+        private_reply_text: body.privateReplyText || body.private_reply_text || null,
+        only_once_per_user:
+          body.onlyOncePerUser ?? body.only_once_per_user ?? true,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ ok: true, rule: data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.patch("/api/comments/auto-reply/rules/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const body = req.body;
+    const update = {};
+
+    if (body.name !== undefined) update.name = body.name;
+    if (body.isEnabled !== undefined || body.is_enabled !== undefined) {
+      update.is_enabled = body.isEnabled ?? body.is_enabled;
+    }
+    if (body.triggerType !== undefined || body.trigger_type !== undefined) {
+      update.trigger_type = body.triggerType || body.trigger_type;
+    }
+    if (body.keywords !== undefined) update.keywords = body.keywords;
+    if (body.replyMode !== undefined || body.reply_mode !== undefined) {
+      update.reply_mode = body.replyMode || body.reply_mode;
+    }
+    if (body.publicReplyText !== undefined || body.public_reply_text !== undefined) {
+      update.public_reply_text = body.publicReplyText ?? body.public_reply_text;
+    }
+    if (body.privateReplyText !== undefined || body.private_reply_text !== undefined) {
+      update.private_reply_text = body.privateReplyText ?? body.private_reply_text;
+    }
+    if (body.onlyOncePerUser !== undefined || body.only_once_per_user !== undefined) {
+      update.only_once_per_user = body.onlyOncePerUser ?? body.only_once_per_user;
+    }
+
+    const { data, error } = await supabase
+      .from("ig_auto_reply_rules")
+      .update(update)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ ok: true, rule: data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.delete("/api/comments/auto-reply/rules/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { error } = await supabase
+      .from("ig_auto_reply_rules")
+      .delete()
+      .eq("id", req.params.id);
+
+    if (error) throw error;
+
+    res.json({ ok: true, deleted: true });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -2796,8 +3234,6 @@ app.delete("/api/ai/results/:id", async (req, res) => {
 app.post("/api/posts", async (req, res) => {
   try {
     requireSupabaseConfig();
-
-    console.log("Create scheduled post body:", JSON.stringify(req.body));
 
     const isBulk =
       Array.isArray(req.body) ||
@@ -2820,42 +3256,33 @@ app.post("/api/posts", async (req, res) => {
           failed.push({
             item,
             error: error.message,
-            details: error.details || null
+            details: error.details || null,
           });
         }
       }
 
       return res.json({
         ok: failed.length === 0,
-        posts: created,
+        posts: created.map(withAliases),
         createdCount: created.length,
         failedCount: failed.length,
-        failed
+        failed,
       });
     }
 
     const post = await createScheduledPostFromInput(req.body);
 
-    res.json({
-      ok: true,
-      post
-    });
+    res.json({ ok: true, post: withAliases(post) });
   } catch (error) {
-    console.error("Create scheduled post failed:", {
-      body: req.body,
-      error: error.response?.data || error.message || error,
-      details: error.details || null
-    });
-
     res.status(error.statusCode || 500).json({
       ok: false,
       error: error.response?.data || error.message || String(error),
-      details: error.details || null
+      details: error.details || null,
     });
   }
 });
 
-app.get("/api/posts", async (req, res) => {
+app.get("/api/posts", async (_req, res) => {
   try {
     requireSupabaseConfig();
 
@@ -2866,15 +3293,9 @@ app.get("/api/posts", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      posts: data || []
-    });
+    res.json({ ok: true, posts: (data || []).map(withAliases) });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -2885,19 +3306,13 @@ app.patch("/api/posts/:id", async (req, res) => {
     const update = {};
 
     if (req.body.caption !== undefined) update.caption = req.body.caption;
-
-    if (req.body.hashtags !== undefined) {
-      update.hashtags = normalizeHashtags(req.body.hashtags);
-    }
-
+    if (req.body.hashtags !== undefined) update.hashtags = normalizeHashtags(req.body.hashtags);
     if (req.body.finalText !== undefined || req.body.final_text !== undefined) {
       update.final_text = req.body.finalText || req.body.final_text;
     }
-
     if (req.body.scheduledAt !== undefined || req.body.scheduled_at !== undefined) {
       update.scheduled_at = req.body.scheduledAt || req.body.scheduled_at;
     }
-
     if (req.body.status !== undefined) update.status = req.body.status;
 
     update.updated_at = new Date().toISOString();
@@ -2911,15 +3326,9 @@ app.patch("/api/posts/:id", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      post: data
-    });
+    res.json({ ok: true, post: withAliases(data) });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -2931,7 +3340,7 @@ app.delete("/api/posts/:id", async (req, res) => {
       .from("scheduled_posts")
       .update({
         status: "cancelled",
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
       .eq("id", req.params.id)
       .select()
@@ -2939,15 +3348,9 @@ app.delete("/api/posts/:id", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      ok: true,
-      post: data
-    });
+    res.json({ ok: true, post: withAliases(data) });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -2965,20 +3368,14 @@ app.post("/api/posts/:id/retry", async (req, res) => {
 
     const updatedPost = await publishScheduledPost(post);
 
-    res.json({
-      ok: true,
-      post: updatedPost
-    });
+    res.json({ ok: true, post: withAliases(updatedPost) });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.message
-    });
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
   }
 });
 
 /**
- * CRON SCHEDULER
+ * CRON
  */
 cron.schedule("*/5 * * * *", async () => {
   try {
@@ -3000,21 +3397,11 @@ cron.schedule("*/5 * * * *", async () => {
 
     if (error) throw error;
 
-    if (!duePosts || duePosts.length === 0) {
-      return;
-    }
-
-    console.log(`Cron found ${duePosts.length} due posts.`);
-
-    for (const post of duePosts) {
+    for (const post of duePosts || []) {
       try {
-        console.log(`Cron publishing post ${post.id}`);
         await publishScheduledPost(post);
       } catch (error) {
-        console.error(
-          `Failed scheduled post ${post.id}:`,
-          error.response?.data || error.message
-        );
+        console.error(`Failed scheduled post ${post.id}:`, error.response?.data || error.message);
       }
     }
   } catch (error) {
@@ -3028,7 +3415,7 @@ cron.schedule("*/5 * * * *", async () => {
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
-    error: `Endpoint not found: ${req.method} ${req.originalUrl}`
+    error: `Endpoint not found: ${req.method} ${req.originalUrl}`,
   });
 });
 
