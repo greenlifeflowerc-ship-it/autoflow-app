@@ -169,6 +169,7 @@ function buildGraphUrl(host, pathValue) {
   const cleanPath = String(pathValue).startsWith("/")
     ? String(pathValue)
     : `/${pathValue}`;
+
   return `${host}/${GRAPH_VERSION}${cleanPath}`;
 }
 
@@ -191,8 +192,8 @@ function createGraphError(pathValue, errors) {
 
 /**
  * مهم:
- * لو التوكن IG/IGA نستخدم graph.instagram.com فقط
- * لو التوكن EA نستخدم graph.facebook.com أولاً
+ * لو التوكن IG/IGA نستخدم graph.instagram.com فقط.
+ * لو التوكن EA نستخدم graph.facebook.com أولاً.
  */
 async function graphGet(pathValue, params = {}, options = {}) {
   const token = cleanAccessToken(
@@ -347,6 +348,7 @@ function isPublicHttpsUrl(url) {
 
 function isValidUuid(value) {
   if (!value) return false;
+
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     String(value).trim(),
   );
@@ -358,6 +360,7 @@ function firstDefined(...values) {
       return value;
     }
   }
+
   return null;
 }
 
@@ -435,15 +438,6 @@ function detectMediaTypeFromFile(file) {
   }
 
   return null;
-}
-
-function normalizeProvider(value) {
-  const provider = String(value || AI_DEFAULT_PROVIDER || "gemini")
-    .trim()
-    .toLowerCase();
-
-  if (["gemini", "openai", "openrouter"].includes(provider)) return provider;
-  return "gemini";
 }
 
 function extractBodySource(body) {
@@ -578,7 +572,6 @@ function withAliases(row) {
 
 function normalizeMessageType(rawType, hasText) {
   const clean = String(rawType || "").toLowerCase();
-
   const allowed = ["text", "image", "video", "audio", "file", "sticker", "unknown"];
 
   if (allowed.includes(clean)) return clean;
@@ -715,7 +708,7 @@ async function uploadVideo(file) {
 }
 
 /**
- * Instagram Publish
+ * Instagram publish.
  */
 async function pollMediaContainerStatus(containerId) {
   await sleep(3000);
@@ -834,7 +827,7 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
 }
 
 /**
- * Gemini / AI
+ * Gemini / AI.
  */
 function buildCaptionPrompt({
   language,
@@ -1154,7 +1147,7 @@ async function insertAiGeneratedMedia({
 }
 
 /**
- * Scheduler helpers
+ * Scheduled posts helpers.
  */
 async function markMediaPublished(mediaAssetId, publishedAt) {
   if (!mediaAssetId || !isValidUuid(mediaAssetId)) return;
@@ -1307,7 +1300,7 @@ async function createScheduledPostFromInput(inputBody) {
 }
 
 /**
- * Webhook helpers
+ * Webhook helpers.
  */
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
@@ -1360,7 +1353,7 @@ async function storeWebhookEvent({
 }
 
 /**
- * Comments helpers
+ * Comments helpers.
  */
 async function fetchCommentDetails(commentId) {
   const response = await graphGet(
@@ -1508,6 +1501,57 @@ async function syncCommentsForMedia(igMediaId) {
   return saved;
 }
 
+async function runCommentsSyncAll() {
+  requireSupabaseConfig();
+  requireInstagramConfig();
+
+  const errors = [];
+  let mediaCount = 0;
+  let commentsCount = 0;
+
+  const mediaResponse = await graphGet(
+    `/${IG_USER_ID}/media`,
+    {
+      fields:
+        "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
+      access_token: getInstagramToken(),
+    },
+    { preferInstagram: true },
+  );
+
+  const mediaItems = mediaResponse.data?.data || [];
+
+  for (const media of mediaItems) {
+    try {
+      await saveMediaCache(media);
+      mediaCount += 1;
+    } catch (error) {
+      errors.push({
+        stage: "media_cache",
+        mediaId: media.id,
+        error: error.response?.data || error.message,
+      });
+    }
+
+    try {
+      const savedComments = await syncCommentsForMedia(media.id);
+      commentsCount += savedComments.length;
+    } catch (error) {
+      errors.push({
+        stage: "comments",
+        mediaId: media.id,
+        error: error.details || error.response?.data || error.message,
+      });
+    }
+  }
+
+  return {
+    mediaCount,
+    commentsCount,
+    errors,
+  };
+}
+
 function autoReplyRuleMatches(rule, commentText) {
   const text = String(commentText || "").toLowerCase().trim();
 
@@ -1652,7 +1696,7 @@ async function applyAutoReplyRulesToComment(commentRow) {
 }
 
 /**
- * Inbox helpers
+ * Inbox helpers.
  */
 async function upsertConversationFromMessage({ senderId, text, sentAt }) {
   requireSupabaseConfig();
@@ -2043,7 +2087,7 @@ async function syncPageConversations() {
 }
 
 /**
- * Health
+ * Health.
  */
 app.get("/", (_req, res) => {
   res.json({
@@ -2097,7 +2141,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 /**
- * Webhooks
+ * Webhooks.
  */
 app.get("/api/webhooks/meta", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -2188,7 +2232,7 @@ app.post("/api/webhooks/meta", async (req, res) => {
 });
 
 /**
- * Debug
+ * Debug.
  */
 app.get("/api/debug/token-status", (_req, res) => {
   const instagramToken = getInstagramToken();
@@ -2294,7 +2338,7 @@ app.get("/api/debug/inbox", async (_req, res) => {
 });
 
 /**
- * Meta test
+ * Meta test.
  */
 app.get("/api/meta/test-connection", async (_req, res) => {
   try {
@@ -2330,7 +2374,7 @@ app.post("/api/meta/test-connection", async (req, res) => {
 });
 
 /**
- * Media upload / library
+ * Media upload / library.
  */
 app.post("/api/upload", upload.any(), async (req, res) => {
   try {
@@ -2449,7 +2493,7 @@ app.delete("/api/media/:id", async (req, res) => {
 });
 
 /**
- * Publish
+ * Publish now.
  */
 app.post("/api/meta/publish-now", async (req, res) => {
   try {
@@ -2480,7 +2524,7 @@ app.post("/api/meta/publish-now", async (req, res) => {
 });
 
 /**
- * Captions
+ * Captions.
  */
 app.post("/api/gemini/generate-caption", async (req, res) => {
   try {
@@ -2543,7 +2587,7 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
 });
 
 /**
- * AI image edit
+ * AI image edit.
  */
 app.post("/api/ai/edit-image", async (req, res) => {
   try {
@@ -2683,7 +2727,7 @@ app.get("/api/ai/results", async (_req, res) => {
 });
 
 /**
- * Comments
+ * Comments.
  */
 app.post("/api/comments/sync-media", async (_req, res) => {
   try {
@@ -2728,56 +2772,50 @@ app.post("/api/comments/sync-media", async (_req, res) => {
 
 app.post("/api/comments/sync-all", async (_req, res) => {
   try {
-    requireSupabaseConfig();
-    requireInstagramConfig();
+    const result = await runCommentsSyncAll();
 
-    const errors = [];
-    let mediaCount = 0;
-    let commentsCount = 0;
-
-    const mediaResponse = await graphGet(
-      `/${IG_USER_ID}/media`,
-      {
-        fields:
-          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
-        access_token: getInstagramToken(),
-      },
-      { preferInstagram: true },
-    );
-
-    const mediaItems = mediaResponse.data?.data || [];
-
-    for (const media of mediaItems) {
-      try {
-        await saveMediaCache(media);
-        mediaCount += 1;
-      } catch (error) {
-        errors.push({
-          stage: "media_cache",
-          mediaId: media.id,
-          error: error.response?.data || error.message,
-        });
-      }
-
-      try {
-        const savedComments = await syncCommentsForMedia(media.id);
-        commentsCount += savedComments.length;
-      } catch (error) {
-        errors.push({
-          stage: "comments",
-          mediaId: media.id,
-          error: error.details || error.response?.data || error.message,
-        });
-      }
-    }
+    console.log("POST /api/comments/sync-all result:", {
+      mediaCount: result.mediaCount,
+      commentsCount: result.commentsCount,
+      errorsCount: result.errors?.length || 0,
+    });
 
     res.json({
       ok: true,
-      mediaCount,
-      commentsCount,
-      errors,
+      ...result,
     });
   } catch (error) {
+    console.error("POST comments sync failed:", error.details || error.response?.data || error.message);
+
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+/**
+ * مهم: GET فقط للدباگ، لأن بعض أزرار Flutter كانت تنادي sync بالغلط كـ GET.
+ */
+app.get("/api/comments/sync-all", async (_req, res) => {
+  try {
+    const result = await runCommentsSyncAll();
+
+    console.log("GET /api/comments/sync-all result:", {
+      mediaCount: result.mediaCount,
+      commentsCount: result.commentsCount,
+      errorsCount: result.errors?.length || 0,
+    });
+
+    res.json({
+      ok: true,
+      methodWarning:
+        "This endpoint should be called with POST from the app. GET is accepted for debug only.",
+      ...result,
+    });
+  } catch (error) {
+    console.error("GET comments sync failed:", error.details || error.response?.data || error.message);
+
     res.status(500).json({
       ok: false,
       error: error.details || error.response?.data || error.message,
@@ -2986,29 +3024,8 @@ app.post("/api/comments/:commentId/hide", async (req, res) => {
   }
 });
 
-app.delete("/api/comments/:commentId", async (req, res) => {
-  try {
-    const response = await axios.delete(metaGraphUrl(`/${req.params.commentId}`), {
-      params: { access_token: getPageToken() || getInstagramToken() },
-      timeout: 30000,
-    });
-
-    await supabase
-      ?.from("ig_comments")
-      .update({ is_deleted: true })
-      .eq("ig_comment_id", req.params.commentId);
-
-    res.json({ ok: true, result: response.data });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.response?.data || error.details || error.message,
-    });
-  }
-});
-
 /**
- * Inbox
+ * Inbox.
  */
 app.get("/api/inbox/conversations", async (req, res) => {
   try {
@@ -3050,11 +3067,49 @@ app.post("/api/inbox/sync-instagram", async (_req, res) => {
   try {
     const result = await syncInstagramConversations();
 
+    console.log("POST /api/inbox/sync-instagram result:", {
+      conversationsCount: result.conversationsCount,
+      messagesCount: result.messagesCount,
+      errorsCount: result.errors?.length || 0,
+    });
+
     res.json({
       ok: true,
       ...result,
     });
   } catch (error) {
+    console.error("POST inbox sync failed:", error.details || error.response?.data || error.message);
+
+    res.status(500).json({
+      ok: false,
+      requiresPageToken: true,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+/**
+ * مهم: GET فقط للدباگ، لأن بعض أزرار Flutter كانت تنادي sync بالغلط كـ GET.
+ */
+app.get("/api/inbox/sync-instagram", async (_req, res) => {
+  try {
+    const result = await syncInstagramConversations();
+
+    console.log("GET /api/inbox/sync-instagram result:", {
+      conversationsCount: result.conversationsCount,
+      messagesCount: result.messagesCount,
+      errorsCount: result.errors?.length || 0,
+    });
+
+    res.json({
+      ok: true,
+      methodWarning:
+        "This endpoint should be called with POST from the app. GET is accepted for debug only.",
+      ...result,
+    });
+  } catch (error) {
+    console.error("GET inbox sync failed:", error.details || error.response?.data || error.message);
+
     res.status(500).json({
       ok: false,
       requiresPageToken: true,
@@ -3338,7 +3393,7 @@ app.post("/api/inbox/send-image", async (req, res) => {
 });
 
 /**
- * Posts
+ * Posts.
  */
 app.post("/api/posts", async (req, res) => {
   try {
@@ -3370,11 +3425,13 @@ app.post("/api/posts", async (req, res) => {
         }
       }
 
+      const rows = created.map(withAliases);
+
       return res.json({
         ok: failed.length === 0,
-        posts: created.map(withAliases),
-        data: created.map(withAliases),
-        items: created.map(withAliases),
+        posts: rows,
+        data: rows,
+        items: rows,
         createdCount: created.length,
         failedCount: failed.length,
         failed,
@@ -3494,7 +3551,7 @@ app.post("/api/posts/:id/retry", async (req, res) => {
 });
 
 /**
- * Auto reply rules
+ * Auto reply rules.
  */
 app.get("/api/comments/auto-reply/rules", async (_req, res) => {
   try {
@@ -3609,7 +3666,7 @@ app.delete("/api/comments/auto-reply/rules/:id", async (req, res) => {
 });
 
 /**
- * Cron
+ * Cron scheduler.
  */
 cron.schedule("*/5 * * * *", async () => {
   try {
@@ -3647,7 +3704,7 @@ cron.schedule("*/5 * * * *", async () => {
 });
 
 /**
- * 404
+ * 404.
  */
 app.use((req, res) => {
   res.status(404).json({
