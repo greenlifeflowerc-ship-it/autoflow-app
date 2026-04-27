@@ -38,10 +38,13 @@ const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
 
-const DEFAULT_BUSINESS_NAME = process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
+const DEFAULT_BUSINESS_NAME =
+  process.env.DEFAULT_BUSINESS_NAME || "Flower Center";
 const DEFAULT_LOCATION = process.env.DEFAULT_LOCATION || "UAE";
 const DEFAULT_CTA = process.env.DEFAULT_CTA || "Contact us today";
 const DEFAULT_HASHTAG_COUNT = Number(process.env.DEFAULT_HASHTAG_COUNT || 10);
+
+const AI_BULK_CONCURRENCY = Number(process.env.AI_BULK_CONCURRENCY || 2);
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
@@ -854,6 +857,135 @@ Rules:
 `;
 }
 
+function buildFixedAiEditRules({
+  preserveProduct = true,
+  keepPot = true,
+  outputSize = "1080x1350",
+  aspectRatio = "4:5",
+  resolution = 1080,
+  quality = "high"
+}) {
+  const rules = [
+    "The result must be photorealistic and look like real professional photography.",
+    "Keep natural perspective, believable scale, correct shadows, realistic lighting, and harmonious colors.",
+    "No cartoon, no painting, no CGI look, no artificial AI artifacts.",
+    "No text, no watermark, no logos unless already part of the original product."
+  ];
+
+  if (preserveProduct) {
+    rules.push(
+      "Keep the original tree / plant / flower arrangement exactly unchanged.",
+      "Do NOT change the product shape, structure, trunk, bark, branches, leaves, flowers, colors, density, height, width, proportions, angle, or realism.",
+      "Preserve the original product identity exactly."
+    );
+  }
+
+  if (keepPot) {
+    rules.push(
+      "Keep the pot / planter / base exactly unchanged unless the user explicitly asks to change it.",
+      "Do NOT change the pot shape, color, material, texture, size, or placement."
+    );
+  }
+
+  rules.push(
+    "Change only the background, environment, surrounding decor, floor, walls, lighting, and atmosphere.",
+    `Output aspect ratio: ${aspectRatio}.`,
+    `Target output size: ${outputSize}.`,
+    `Target resolution: ${resolution}.`,
+    `Quality level: ${quality}.`
+  );
+
+  return rules;
+}
+
+function getAiEditPresetInstruction(preset, customPrompt) {
+  const cleanPreset = String(preset || "Luxury Interior").trim();
+
+  if (cleanPreset === "Custom") {
+    return customPrompt && String(customPrompt).trim()
+      ? String(customPrompt).trim()
+      : "Create a realistic premium background that enhances the product.";
+  }
+
+  const presets = {
+    "Change Background":
+      "Replace the background with a clean premium realistic environment that suits the product.",
+    "Luxury Interior":
+      "Place the product in a refined luxury interior with warm neutral walls, elegant flooring, soft natural light, and premium decor.",
+    "Villa Entrance":
+      "Place the product in a luxurious villa entrance with elegant architecture, premium flooring, soft lighting, and a welcoming high-end atmosphere.",
+    "Staircase Decor":
+      "Create a realistic under-stair or staircase decor scene with elegant walls, premium flooring, soft lighting, stones or greenery accents where appropriate.",
+    "Minimal Modern Space":
+      "Place the product in a minimal modern interior with clean lines, warm neutral colors, subtle luxury, and calm composition.",
+    "Commercial / Mall Decor":
+      "Place the product in a realistic commercial interior such as a mall, showroom, lobby, or retail space with polished finishes and professional lighting.",
+    "Hotel Lobby Decor":
+      "Place the product in a luxury hotel lobby with elegant materials, soft ambient lighting, premium furniture, and a high-end hospitality feel.",
+    "Outdoor Courtyard":
+      "Place the product in a realistic outdoor courtyard with natural light, architectural walls, stone or marble floor, and subtle landscape details.",
+    "Neutral Studio Background":
+      "Place the product on a clean neutral studio background with realistic soft shadows and premium product photography lighting."
+  };
+
+  return presets[cleanPreset] || presets["Luxury Interior"];
+}
+
+function buildAiEditPrompt({
+  preset = "Luxury Interior",
+  customPrompt = "",
+  editMode = "background_only",
+  preserveProduct = true,
+  keepPot = true,
+  aspectRatio = "4:5",
+  outputSize = "1080x1350",
+  resolution = 1080,
+  quality = "high",
+  backgroundIntensity = "medium",
+  userPrompt = ""
+}) {
+  const fixedRules = buildFixedAiEditRules({
+    preserveProduct,
+    keepPot,
+    outputSize,
+    aspectRatio,
+    resolution,
+    quality
+  });
+
+  const presetInstruction = getAiEditPresetInstruction(preset, customPrompt);
+
+  return `
+Professional AI image edit request.
+
+Edit preset:
+${preset}
+
+Edit mode:
+${editMode}
+
+Background intensity:
+${backgroundIntensity}
+
+Main scene instruction:
+${userPrompt && String(userPrompt).trim() ? String(userPrompt).trim() : presetInstruction}
+
+Fixed preservation rules:
+${fixedRules.map((rule) => `- ${rule}`).join("\n")}
+
+Scene realism rules:
+- The edited image must match the original camera angle.
+- The product must sit naturally in the new space.
+- Scale must be believable relative to the floor, walls, furniture, and architecture.
+- Lighting direction must be consistent across product and environment.
+- Shadows must be realistic and grounded.
+- Colors must be harmonious and not oversaturated.
+- The final image must be suitable for premium Instagram marketing and product presentation.
+
+Return only the edited image.
+`;
+}
+
 async function generateTextWithGemini(
   prompt,
   modelName = GEMINI_TEXT_MODEL,
@@ -1023,39 +1155,58 @@ async function generateCaptionWithAI({
 
 async function generateEditPromptWithGemini({
   imageUrl,
-  editStyle = "luxury interior background",
+  preset = "Luxury Interior",
+  editMode = "background_only",
+  preserveProduct = true,
+  keepPot = true,
   language = "english",
+  customPrompt = "",
   model = GEMINI_TEXT_MODEL,
   apiKey = GEMINI_API_KEY
 }) {
-  const prompt = `
-Create a professional AI image editing prompt for this product image.
+  const basePrompt = buildAiEditPrompt({
+    preset,
+    customPrompt,
+    editMode,
+    preserveProduct,
+    keepPot,
+    userPrompt: "",
+    aspectRatio: "4:5",
+    outputSize: "1080x1350",
+    resolution: 1080,
+    quality: "high",
+    backgroundIntensity: "medium"
+  });
 
-Edit style:
-${editStyle}
+  const analysisPrompt = `
+Analyze this product image and create a professional AI image editing prompt.
 
 Language:
 ${language}
 
-Rules:
-- Preserve the main product exactly.
-- Keep the artificial tree, flowers, pot, planter, trunk, leaves, branches, shape, size, angle, and proportions exactly the same.
-- Change only the background, environment, decoration, lighting, shadows, and composition.
-- Make it photorealistic.
-- Make it Instagram-ready.
-- Default output size: 1080x1350.
-- No cartoon, no painting, no AI-looking result.
-- No text or watermark.
+Preset:
+${preset}
+
+Edit mode:
+${editMode}
+
+The generated prompt must preserve the product exactly and change only the requested environment.
+
+Use these fixed rules as mandatory:
+${basePrompt}
 
 Return strict JSON only:
 {
-  "prompt": "full editing prompt here"
+  "prompt": "full detailed edit prompt",
+  "preset": "${preset}",
+  "editMode": "${editMode}",
+  "fixedRules": ["rule 1", "rule 2"]
 }
 `;
 
   const text = await generateCaptionWithGeminiVision({
     imageUrl,
-    prompt,
+    prompt: analysisPrompt,
     modelName: model,
     apiKey,
     fallbackTextOnly: false
@@ -1064,7 +1215,13 @@ Return strict JSON only:
   const parsed = parseJsonLoose(text);
 
   return {
-    prompt: parsed?.prompt || String(text).replace(/```json|```/g, "").trim()
+    prompt: parsed?.prompt || String(text).replace(/```json|```/g, "").trim(),
+    preset: parsed?.preset || preset,
+    editMode: parsed?.editMode || editMode,
+    fixedRules:
+      Array.isArray(parsed?.fixedRules) && parsed.fixedRules.length > 0
+        ? parsed.fixedRules
+        : buildFixedAiEditRules({})
   };
 }
 
@@ -1103,7 +1260,7 @@ async function editImageWithGemini({
     headers: {
       "Content-Type": "application/json"
     },
-    timeout: 120000
+    timeout: 180000
   });
 
   const parts = response.data?.candidates?.[0]?.content?.parts || [];
@@ -1148,6 +1305,59 @@ async function editImageWithGemini({
     mediaType: "image",
     model
   };
+}
+
+async function insertAiGeneratedMedia({
+  editedImageUrl,
+  sourceMediaAssetId,
+  aiJobId,
+  prompt,
+  editMode,
+  provider,
+  model,
+  aspectRatio,
+  outputSize,
+  resolution,
+  quality
+}) {
+  requireSupabaseConfig();
+
+  const safeSourceMediaAssetId = isValidUuid(sourceMediaAssetId)
+    ? sourceMediaAssetId
+    : null;
+
+  const safeAiJobId = isValidUuid(aiJobId) ? aiJobId : null;
+
+  const { data, error } = await supabase
+    .from("media_assets")
+    .insert({
+      media_url: editedImageUrl,
+      image_url: editedImageUrl,
+      video_url: null,
+      media_type: "image",
+      mime_type: "image/jpeg",
+      file_name: "ai-edited-image.jpg",
+      is_uploaded: true,
+      is_scheduled: false,
+      is_published: false,
+      source_media_asset_id: safeSourceMediaAssetId,
+      is_ai_generated: true,
+      ai_job_id: safeAiJobId,
+      ai_prompt: prompt,
+      ai_edit_mode: editMode,
+      ai_provider: provider,
+      ai_model: model,
+      ai_aspect_ratio: aspectRatio,
+      ai_output_size: outputSize,
+      ai_resolution: Number(resolution) || null,
+      ai_quality: quality
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  return data;
 }
 
 async function markMediaPublished(mediaAssetId, publishedAt) {
@@ -1347,6 +1557,152 @@ async function createScheduledPostFromInput(inputBody) {
   return post;
 }
 
+async function runWithConcurrency(items, concurrency, task) {
+  if (!items || items.length === 0) return;
+
+  let nextIndex = 0;
+  const safeConcurrency = Math.max(1, Math.min(Number(concurrency) || 1, items.length));
+
+  async function worker() {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      if (currentIndex >= items.length) return;
+
+      await task(items[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: safeConcurrency }, () => worker()));
+}
+
+async function processAiBulkJob(jobId) {
+  requireSupabaseConfig();
+
+  const { data: job, error: jobError } = await supabase
+    .from("ai_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+
+  if (jobError) {
+    console.error("Could not load AI job:", jobError);
+    return;
+  }
+
+  await supabase
+    .from("ai_jobs")
+    .update({
+      status: "processing",
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", jobId);
+
+  const { data: items, error: itemsError } = await supabase
+    .from("ai_job_items")
+    .select("*")
+    .eq("ai_job_id", jobId)
+    .order("created_at", { ascending: true });
+
+  if (itemsError) {
+    console.error("Could not load AI job items:", itemsError);
+
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "failed",
+        error_message: itemsError.message,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", jobId);
+
+    return;
+  }
+
+  let completed = 0;
+  let failed = 0;
+
+  await runWithConcurrency(items || [], AI_BULK_CONCURRENCY, async (item) => {
+    await supabase
+      .from("ai_job_items")
+      .update({
+        status: "processing",
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", item.id);
+
+    try {
+      const result = await editImageWithGemini({
+        originalImageUrl: item.original_image_url,
+        prompt: item.prompt,
+        model: job.model || GEMINI_IMAGE_MODEL
+      });
+
+      let savedMedia = null;
+
+      savedMedia = await insertAiGeneratedMedia({
+        editedImageUrl: result.editedImageUrl,
+        sourceMediaAssetId: item.original_media_asset_id,
+        aiJobId: job.id,
+        prompt: item.prompt,
+        editMode: job.edit_mode,
+        provider: job.provider,
+        model: job.model,
+        aspectRatio: job.aspect_ratio,
+        outputSize: job.output_size,
+        resolution: job.resolution,
+        quality: job.quality
+      });
+
+      await supabase
+        .from("ai_job_items")
+        .update({
+          status: "completed",
+          edited_image_url: result.editedImageUrl,
+          result_media_asset_id: savedMedia?.id || null,
+          error_message: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", item.id);
+
+      completed += 1;
+    } catch (error) {
+      failed += 1;
+
+      await supabase
+        .from("ai_job_items")
+        .update({
+          status: "failed",
+          error_message: error.response?.data
+            ? JSON.stringify(error.response.data)
+            : error.message,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", item.id);
+    }
+
+    await supabase
+      .from("ai_jobs")
+      .update({
+        completed_items: completed,
+        failed_items: failed,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", jobId);
+  });
+
+  await supabase
+    .from("ai_jobs")
+    .update({
+      status: failed > 0 && completed === 0 ? "failed" : "completed",
+      completed_items: completed,
+      failed_items: failed,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", jobId);
+}
+
 /**
  * ROOT / HEALTH
  */
@@ -1360,7 +1716,8 @@ app.get("/", (req, res) => {
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
     ),
-    supabaseConfigured: Boolean(supabase)
+    supabaseConfigured: Boolean(supabase),
+    aiStudio: true
   });
 });
 
@@ -1373,7 +1730,8 @@ app.get("/api/health", (req, res) => {
     cloudinaryConfigured: Boolean(
       CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET
     ),
-    supabaseConfigured: Boolean(supabase)
+    supabaseConfigured: Boolean(supabase),
+    aiStudio: true
   });
 });
 
@@ -1907,6 +2265,11 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
 });
 
 app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
+  req.url = "/api/ai/generate-edit-prompt";
+  app.handle(req, res);
+});
+
+app.post("/api/ai/generate-edit-prompt", async (req, res) => {
   try {
     const imageUrl =
       getBodyValue(req.body, "imageUrl", "image_url") ||
@@ -1920,6 +2283,14 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
     }
 
     const provider = normalizeProvider(req.body.provider || "gemini");
+
+    if (provider !== "gemini") {
+      return res.status(400).json({
+        ok: false,
+        error: "AI edit prompt generation currently supports Gemini provider only."
+      });
+    }
+
     const apiKey = getProviderApiKey({
       provider,
       apiKey: req.body.apiKey
@@ -1927,9 +2298,12 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
 
     const result = await generateEditPromptWithGemini({
       imageUrl,
-      editStyle:
-        req.body.editStyle || req.body.edit_style || "luxury interior background",
+      preset: req.body.preset || "Luxury Interior",
+      editMode: req.body.editMode || req.body.edit_mode || "background_only",
+      preserveProduct: req.body.preserveProduct !== false,
+      keepPot: req.body.keepPot !== false,
       language: req.body.language || "english",
+      customPrompt: req.body.customPrompt || req.body.custom_prompt || "",
       model: req.body.model || GEMINI_TEXT_MODEL,
       apiKey
     });
@@ -1939,6 +2313,8 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
       result
     });
   } catch (error) {
+    console.error("Generate edit prompt failed:", error.response?.data || error.message);
+
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1948,6 +2324,8 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
 
 app.post("/api/ai/edit-image", async (req, res) => {
   try {
+    requireSupabaseConfig();
+
     const originalImageUrl =
       getBodyValue(req.body, "originalImageUrl", "original_image_url") ||
       getBodyValue(req.body, "imageUrl", "image_url") ||
@@ -1960,29 +2338,454 @@ app.post("/api/ai/edit-image", async (req, res) => {
       });
     }
 
-    const prompt = req.body.prompt || req.body.ai_edit_prompt || "";
+    const provider = normalizeProvider(req.body.provider || "gemini");
 
-    if (!prompt) {
+    if (provider !== "gemini") {
+      return res.status(400).json({
+        ok: false,
+        error: "AI image editing currently supports Gemini provider only."
+      });
+    }
+
+    const model = req.body.model || GEMINI_IMAGE_MODEL;
+    const mediaAssetId = req.body.mediaAssetId || req.body.media_asset_id || null;
+
+    const editMode = req.body.editMode || req.body.edit_mode || "background_only";
+    const aspectRatio = req.body.aspectRatio || req.body.aspect_ratio || "4:5";
+    const outputSize = req.body.outputSize || req.body.output_size || "1080x1350";
+    const resolution = Number(req.body.resolution || 1080);
+    const quality = req.body.quality || "high";
+    const backgroundIntensity =
+      req.body.backgroundIntensity || req.body.background_intensity || "medium";
+    const saveToLibrary = req.body.saveToLibrary !== false;
+
+    const userPrompt = req.body.prompt || req.body.ai_edit_prompt || "";
+
+    if (!userPrompt) {
       return res.status(400).json({
         ok: false,
         error: "prompt is required."
       });
     }
 
-    const result = await editImageWithGemini({
-      originalImageUrl,
-      prompt,
-      model: req.body.model || GEMINI_IMAGE_MODEL
+    const finalPrompt = buildAiEditPrompt({
+      preset: req.body.preset || "Custom",
+      customPrompt: req.body.customPrompt || "",
+      editMode,
+      preserveProduct: req.body.preserveProduct !== false,
+      keepPot: req.body.keepPot !== false,
+      aspectRatio,
+      outputSize,
+      resolution,
+      quality,
+      backgroundIntensity,
+      userPrompt
+    });
+
+    const { data: job, error: jobError } = await supabase
+      .from("ai_jobs")
+      .insert({
+        job_type: "single_edit",
+        status: "processing",
+        total_items: 1,
+        completed_items: 0,
+        failed_items: 0,
+        provider,
+        model,
+        edit_mode: editMode,
+        aspect_ratio: aspectRatio,
+        output_size: outputSize,
+        resolution,
+        quality
+      })
+      .select()
+      .single();
+
+    if (jobError) throw jobError;
+
+    const { data: jobItem, error: itemError } = await supabase
+      .from("ai_job_items")
+      .insert({
+        ai_job_id: job.id,
+        original_media_asset_id: isValidUuid(mediaAssetId) ? mediaAssetId : null,
+        original_image_url: originalImageUrl,
+        prompt: finalPrompt,
+        status: "processing"
+      })
+      .select()
+      .single();
+
+    if (itemError) throw itemError;
+
+    try {
+      const result = await editImageWithGemini({
+        originalImageUrl,
+        prompt: finalPrompt,
+        model
+      });
+
+      let savedMedia = null;
+
+      if (saveToLibrary) {
+        savedMedia = await insertAiGeneratedMedia({
+          editedImageUrl: result.editedImageUrl,
+          sourceMediaAssetId: mediaAssetId,
+          aiJobId: job.id,
+          prompt: finalPrompt,
+          editMode,
+          provider,
+          model,
+          aspectRatio,
+          outputSize,
+          resolution,
+          quality
+        });
+      }
+
+      await supabase
+        .from("ai_job_items")
+        .update({
+          status: "completed",
+          edited_image_url: result.editedImageUrl,
+          result_media_asset_id: savedMedia?.id || null,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", jobItem.id);
+
+      await supabase
+        .from("ai_jobs")
+        .update({
+          status: "completed",
+          completed_items: 1,
+          failed_items: 0,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", job.id);
+
+      return res.json({
+        ok: true,
+        result: {
+          jobId: job.id,
+          originalMediaAssetId: mediaAssetId,
+          editedImageUrl: result.editedImageUrl,
+          prompt: finalPrompt,
+          status: "completed",
+          savedMediaAssetId: savedMedia?.id || null,
+          media: savedMedia
+        }
+      });
+    } catch (error) {
+      await supabase
+        .from("ai_job_items")
+        .update({
+          status: "failed",
+          error_message: error.response?.data
+            ? JSON.stringify(error.response.data)
+            : error.message,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", jobItem.id);
+
+      await supabase
+        .from("ai_jobs")
+        .update({
+          status: "failed",
+          failed_items: 1,
+          error_message: error.response?.data
+            ? JSON.stringify(error.response.data)
+            : error.message,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", job.id);
+
+      throw error;
+    }
+  } catch (error) {
+    console.error("AI edit image failed:", error.response?.data || error.message);
+
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
+app.post("/api/ai/bulk-edit", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    const commonOptions = req.body.commonOptions || req.body.common_options || {};
+
+    if (items.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "items must be a non-empty array."
+      });
+    }
+
+    const provider = normalizeProvider(commonOptions.provider || req.body.provider || "gemini");
+
+    if (provider !== "gemini") {
+      return res.status(400).json({
+        ok: false,
+        error: "AI bulk image editing currently supports Gemini provider only."
+      });
+    }
+
+    const model = commonOptions.model || req.body.model || GEMINI_IMAGE_MODEL;
+    const editMode = commonOptions.editMode || commonOptions.edit_mode || "background_only";
+    const aspectRatio = commonOptions.aspectRatio || commonOptions.aspect_ratio || "4:5";
+    const outputSize = commonOptions.outputSize || commonOptions.output_size || "1080x1350";
+    const resolution = Number(commonOptions.resolution || 1080);
+    const quality = commonOptions.quality || "high";
+
+    const { data: job, error: jobError } = await supabase
+      .from("ai_jobs")
+      .insert({
+        job_type: "bulk_edit",
+        status: "pending",
+        total_items: items.length,
+        completed_items: 0,
+        failed_items: 0,
+        provider,
+        model,
+        edit_mode: editMode,
+        aspect_ratio: aspectRatio,
+        output_size: outputSize,
+        resolution,
+        quality
+      })
+      .select()
+      .single();
+
+    if (jobError) throw jobError;
+
+    const jobItemsPayload = items.map((item) => {
+      const originalImageUrl =
+        item.originalImageUrl ||
+        item.original_image_url ||
+        item.imageUrl ||
+        item.image_url ||
+        item.mediaUrl ||
+        item.media_url;
+
+      const mediaAssetId = item.mediaAssetId || item.media_asset_id || null;
+
+      const rawPrompt = item.prompt || commonOptions.prompt || "";
+
+      const finalPrompt = buildAiEditPrompt({
+        preset: item.preset || commonOptions.preset || "Custom",
+        customPrompt: item.customPrompt || commonOptions.customPrompt || "",
+        editMode,
+        preserveProduct: item.preserveProduct !== false,
+        keepPot: item.keepPot !== false,
+        aspectRatio,
+        outputSize,
+        resolution,
+        quality,
+        backgroundIntensity:
+          item.backgroundIntensity ||
+          commonOptions.backgroundIntensity ||
+          "medium",
+        userPrompt: rawPrompt
+      });
+
+      return {
+        ai_job_id: job.id,
+        original_media_asset_id: isValidUuid(mediaAssetId) ? mediaAssetId : null,
+        original_image_url: originalImageUrl,
+        prompt: finalPrompt,
+        status: "pending"
+      };
+    });
+
+    const invalid = jobItemsPayload.find((item) => !item.original_image_url);
+
+    if (invalid) {
+      return res.status(400).json({
+        ok: false,
+        error: "Every item must include originalImageUrl, imageUrl, or mediaUrl."
+      });
+    }
+
+    const { error: itemsError } = await supabase
+      .from("ai_job_items")
+      .insert(jobItemsPayload);
+
+    if (itemsError) throw itemsError;
+
+    setImmediate(() => {
+      processAiBulkJob(job.id).catch((error) => {
+        console.error("Background AI bulk job failed:", error.message);
+      });
     });
 
     res.json({
       ok: true,
-      result
+      job: {
+        id: job.id,
+        status: "processing",
+        totalItems: items.length,
+        total_items: items.length
+      }
+    });
+  } catch (error) {
+    console.error("AI bulk edit failed:", error.response?.data || error.message);
+
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
+app.get("/api/ai/jobs", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("ai_jobs")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      jobs: data || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/api/ai/jobs/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data: job, error: jobError } = await supabase
+      .from("ai_jobs")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (jobError) throw jobError;
+
+    const { data: items, error: itemsError } = await supabase
+      .from("ai_job_items")
+      .select("*")
+      .eq("ai_job_id", req.params.id)
+      .order("created_at", { ascending: true });
+
+    if (itemsError) throw itemsError;
+
+    res.json({
+      ok: true,
+      job,
+      items: items || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/api/ai/results", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("media_assets")
+      .select("*")
+      .eq("is_ai_generated", true)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      results: data || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/api/ai/save-result", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const editedImageUrl =
+      req.body.editedImageUrl ||
+      req.body.edited_image_url ||
+      req.body.imageUrl ||
+      req.body.image_url ||
+      req.body.mediaUrl ||
+      req.body.media_url;
+
+    if (!editedImageUrl || !isPublicHttpsUrl(editedImageUrl)) {
+      return res.status(400).json({
+        ok: false,
+        error: "editedImageUrl must be a public HTTPS URL."
+      });
+    }
+
+    const media = await insertAiGeneratedMedia({
+      editedImageUrl,
+      sourceMediaAssetId:
+        req.body.sourceMediaAssetId || req.body.source_media_asset_id || null,
+      aiJobId: req.body.aiJobId || req.body.ai_job_id || null,
+      prompt: req.body.prompt || "",
+      editMode: req.body.editMode || req.body.edit_mode || null,
+      provider: req.body.provider || null,
+      model: req.body.model || null,
+      aspectRatio: req.body.aspectRatio || req.body.aspect_ratio || null,
+      outputSize: req.body.outputSize || req.body.output_size || null,
+      resolution: req.body.resolution || null,
+      quality: req.body.quality || null
+    });
+
+    res.json({
+      ok: true,
+      media
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
+    });
+  }
+});
+
+app.delete("/api/ai/results/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { error } = await supabase
+      .from("media_assets")
+      .delete()
+      .eq("id", req.params.id)
+      .eq("is_ai_generated", true);
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      deleted: true
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
     });
   }
 });
