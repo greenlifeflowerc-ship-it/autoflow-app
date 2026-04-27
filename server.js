@@ -169,7 +169,6 @@ function buildGraphUrl(host, pathValue) {
   const cleanPath = String(pathValue).startsWith("/")
     ? String(pathValue)
     : `/${pathValue}`;
-
   return `${host}/${GRAPH_VERSION}${cleanPath}`;
 }
 
@@ -191,10 +190,9 @@ function createGraphError(pathValue, errors) {
 }
 
 /**
- * CRITICAL FIX:
- * - If token starts IG / IGA => use graph.instagram.com only.
- * - If token starts EA => use graph.facebook.com first.
- * This prevents "Cannot parse access token" when IG token is sent to Meta Graph.
+ * مهم:
+ * لو التوكن IG/IGA نستخدم graph.instagram.com فقط
+ * لو التوكن EA نستخدم graph.facebook.com أولاً
  */
 async function graphGet(pathValue, params = {}, options = {}) {
   const token = cleanAccessToken(
@@ -204,28 +202,31 @@ async function graphGet(pathValue, params = {}, options = {}) {
       FACEBOOK_PAGE_ACCESS_TOKEN,
   );
 
-  if (!token) {
-    throw new Error("Missing access token.");
-  }
+  if (!token) throw new Error("Missing access token.");
 
   const mergedParams = {
     ...params,
     access_token: token,
   };
 
-  const errors = [];
   const tokenIsInstagram = isLikelyInstagramToken(token);
   const tokenIsFacebook = isLikelyFacebookToken(token);
 
-  let hostOrder = [];
+  let hostOrder;
 
   if (tokenIsInstagram) {
     hostOrder = ["instagram"];
   } else if (tokenIsFacebook) {
-    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+    hostOrder = options.preferInstagram
+      ? ["instagram", "meta"]
+      : ["meta", "instagram"];
   } else {
-    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+    hostOrder = options.preferInstagram
+      ? ["instagram", "meta"]
+      : ["meta", "instagram"];
   }
+
+  const errors = [];
 
   for (const hostType of hostOrder) {
     const url =
@@ -267,28 +268,31 @@ async function graphPost(pathValue, data = null, params = {}, options = {}) {
       FACEBOOK_PAGE_ACCESS_TOKEN,
   );
 
-  if (!token) {
-    throw new Error("Missing access token.");
-  }
+  if (!token) throw new Error("Missing access token.");
 
   const mergedParams = {
     ...params,
     access_token: token,
   };
 
-  const errors = [];
   const tokenIsInstagram = isLikelyInstagramToken(token);
   const tokenIsFacebook = isLikelyFacebookToken(token);
 
-  let hostOrder = [];
+  let hostOrder;
 
   if (tokenIsInstagram) {
     hostOrder = ["instagram"];
   } else if (tokenIsFacebook) {
-    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+    hostOrder = options.preferInstagram
+      ? ["instagram", "meta"]
+      : ["meta", "instagram"];
   } else {
-    hostOrder = options.preferInstagram ? ["instagram", "meta"] : ["meta", "instagram"];
+    hostOrder = options.preferInstagram
+      ? ["instagram", "meta"]
+      : ["meta", "instagram"];
   }
+
+  const errors = [];
 
   for (const hostType of hostOrder) {
     const url =
@@ -328,7 +332,7 @@ function cleanupFile(filePath) {
       fs.unlinkSync(filePath);
     }
   } catch {
-    // ignore cleanup errors
+    // ignore
   }
 }
 
@@ -343,7 +347,6 @@ function isPublicHttpsUrl(url) {
 
 function isValidUuid(value) {
   if (!value) return false;
-
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     String(value).trim(),
   );
@@ -355,7 +358,6 @@ function firstDefined(...values) {
       return value;
     }
   }
-
   return null;
 }
 
@@ -441,18 +443,7 @@ function normalizeProvider(value) {
     .toLowerCase();
 
   if (["gemini", "openai", "openrouter"].includes(provider)) return provider;
-
   return "gemini";
-}
-
-function getProviderApiKey({ provider, apiKey }) {
-  const cleanKey = apiKey ? String(apiKey).trim() : "";
-
-  if (cleanKey.length > 0) return cleanKey;
-
-  if (provider === "gemini") return GEMINI_API_KEY;
-
-  return null;
 }
 
 function extractBodySource(body) {
@@ -576,7 +567,24 @@ function withAliases(row) {
     unreadCount: row.unread_count ?? row.unreadCount,
     messageType: row.message_type ?? row.messageType,
     sentAt: row.sent_at ?? row.sentAt,
+    igCommentId: row.ig_comment_id ?? row.igCommentId,
+    igMediaId: row.ig_media_id ?? row.igMediaId,
+    parentCommentId: row.parent_comment_id ?? row.parentCommentId,
+    likeCount: row.like_count ?? row.likeCount,
+    repliedByApp: row.replied_by_app ?? row.repliedByApp,
+    privateRepliedByApp: row.private_replied_by_app ?? row.privateRepliedByApp,
   };
+}
+
+function normalizeMessageType(rawType, hasText) {
+  const clean = String(rawType || "").toLowerCase();
+
+  const allowed = ["text", "image", "video", "audio", "file", "sticker", "unknown"];
+
+  if (allowed.includes(clean)) return clean;
+  if (hasText) return "text";
+
+  return "unknown";
 }
 
 async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
@@ -706,6 +714,9 @@ async function uploadVideo(file) {
   };
 }
 
+/**
+ * Instagram Publish
+ */
 async function pollMediaContainerStatus(containerId) {
   await sleep(3000);
 
@@ -822,6 +833,9 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
   };
 }
 
+/**
+ * Gemini / AI
+ */
 function buildCaptionPrompt({
   language,
   tone,
@@ -1139,6 +1153,9 @@ async function insertAiGeneratedMedia({
   return data;
 }
 
+/**
+ * Scheduler helpers
+ */
 async function markMediaPublished(mediaAssetId, publishedAt) {
   if (!mediaAssetId || !isValidUuid(mediaAssetId)) return;
 
@@ -1289,6 +1306,9 @@ async function createScheduledPostFromInput(inputBody) {
   return post;
 }
 
+/**
+ * Webhook helpers
+ */
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
 
@@ -1339,6 +1359,9 @@ async function storeWebhookEvent({
   return data;
 }
 
+/**
+ * Comments helpers
+ */
 async function fetchCommentDetails(commentId) {
   const response = await graphGet(
     `/${commentId}`,
@@ -1451,14 +1474,12 @@ async function saveMediaCache(media) {
 async function syncCommentsForMedia(igMediaId) {
   requireSupabaseConfig();
 
-  const token = getInstagramToken() || getPageToken();
-
   const response = await graphGet(
     `/${igMediaId}/comments`,
     {
       fields:
         "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}",
-      access_token: token,
+      access_token: getInstagramToken() || getPageToken(),
     },
     { preferInstagram: true },
   );
@@ -1487,6 +1508,152 @@ async function syncCommentsForMedia(igMediaId) {
   return saved;
 }
 
+function autoReplyRuleMatches(rule, commentText) {
+  const text = String(commentText || "").toLowerCase().trim();
+
+  if (!rule.is_enabled) return false;
+  if (rule.trigger_type === "any_comment") return true;
+
+  const keywords = Array.isArray(rule.keywords)
+    ? rule.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean)
+    : [];
+
+  if (keywords.length === 0) return false;
+
+  if (rule.trigger_type === "keyword") {
+    return keywords.some((keyword) => text.includes(keyword));
+  }
+
+  if (rule.trigger_type === "exact_match") {
+    return keywords.some((keyword) => text === keyword);
+  }
+
+  return false;
+}
+
+async function sendCommentPublicReply(igCommentId, message) {
+  const response = await graphPost(
+    `/${igCommentId}/replies`,
+    null,
+    {
+      message,
+      access_token: getInstagramToken() || getPageToken(),
+    },
+    { preferInstagram: true },
+  );
+
+  return response.data;
+}
+
+async function sendCommentPrivateReply(igCommentId, message) {
+  const response = await graphPost(
+    `/${igCommentId}/private_replies`,
+    null,
+    {
+      message,
+      access_token: getInstagramToken() || getPageToken(),
+    },
+    { preferInstagram: true },
+  );
+
+  return response.data;
+}
+
+async function applyAutoReplyRulesToComment(commentRow) {
+  if (!AUTO_REPLY_ENABLED || !commentRow?.ig_comment_id) return;
+
+  requireSupabaseConfig();
+
+  const { data: rules, error } = await supabase
+    .from("ig_auto_reply_rules")
+    .select("*")
+    .eq("is_enabled", true);
+
+  if (error) {
+    console.warn("Could not load auto reply rules:", error.message);
+    return;
+  }
+
+  for (const rule of rules || []) {
+    if (!autoReplyRuleMatches(rule, commentRow.text)) continue;
+
+    if (rule.only_once_per_user && commentRow.user_id) {
+      const { data: existingLog } = await supabase
+        .from("ig_auto_reply_logs")
+        .select("id")
+        .eq("rule_id", rule.id)
+        .eq("user_id", commentRow.user_id)
+        .eq("status", "sent")
+        .maybeSingle();
+
+      if (existingLog) {
+        await supabase.from("ig_auto_reply_logs").insert({
+          rule_id: rule.id,
+          ig_comment_id: commentRow.ig_comment_id,
+          ig_media_id: commentRow.ig_media_id,
+          username: commentRow.username,
+          user_id: commentRow.user_id,
+          reply_mode: rule.reply_mode,
+          status: "skipped",
+          message_text: "Skipped because only_once_per_user is enabled.",
+        });
+
+        continue;
+      }
+    }
+
+    try {
+      if (
+        (rule.reply_mode === "public_reply" || rule.reply_mode === "both") &&
+        rule.public_reply_text
+      ) {
+        await sendCommentPublicReply(commentRow.ig_comment_id, rule.public_reply_text);
+      }
+
+      if (
+        (rule.reply_mode === "private_reply" || rule.reply_mode === "both") &&
+        rule.private_reply_text
+      ) {
+        await sendCommentPrivateReply(commentRow.ig_comment_id, rule.private_reply_text);
+      }
+
+      await supabase.from("ig_auto_reply_logs").insert({
+        rule_id: rule.id,
+        ig_comment_id: commentRow.ig_comment_id,
+        ig_media_id: commentRow.ig_media_id,
+        username: commentRow.username,
+        user_id: commentRow.user_id,
+        reply_mode: rule.reply_mode,
+        message_text:
+          rule.reply_mode === "public_reply"
+            ? rule.public_reply_text
+            : rule.private_reply_text || rule.public_reply_text,
+        status: "sent",
+      });
+    } catch (replyError) {
+      await supabase.from("ig_auto_reply_logs").insert({
+        rule_id: rule.id,
+        ig_comment_id: commentRow.ig_comment_id,
+        ig_media_id: commentRow.ig_media_id,
+        username: commentRow.username,
+        user_id: commentRow.user_id,
+        reply_mode: rule.reply_mode,
+        message_text:
+          rule.reply_mode === "public_reply"
+            ? rule.public_reply_text
+            : rule.private_reply_text || rule.public_reply_text,
+        status: "failed",
+        error_message: replyError.response?.data
+          ? JSON.stringify(replyError.response.data)
+          : replyError.message,
+      });
+    }
+  }
+}
+
+/**
+ * Inbox helpers
+ */
 async function upsertConversationFromMessage({ senderId, text, sentAt }) {
   requireSupabaseConfig();
 
@@ -1512,7 +1679,6 @@ async function upsertConversationFromMessage({ senderId, text, sentAt }) {
       .single();
 
     if (error) throw error;
-
     return data;
   }
 
@@ -1548,7 +1714,7 @@ async function insertInboundMessageFromWebhook(messagingEvent) {
     : new Date().toISOString();
 
   const attachment = Array.isArray(message.attachments) ? message.attachments[0] : null;
-  const messageType = attachment?.type || (text ? "text" : "unknown");
+  const messageType = normalizeMessageType(attachment?.type, Boolean(text));
   const mediaUrl = attachment?.payload?.url || null;
 
   const conversation = await upsertConversationFromMessage({
@@ -1675,7 +1841,10 @@ async function saveConversationMessages(conversationRow, messages) {
 
   for (const msg of messages || []) {
     const attachment = normalizeMessageAttachment(msg);
-    const messageType = attachment?.type || (msg.message || msg.text ? "text" : "unknown");
+    const messageType = normalizeMessageType(
+      attachment?.type,
+      Boolean(msg.message || msg.text),
+    );
     const mediaUrl = attachment?.payload?.url || attachment?.url || null;
     const direction = normalizeMessageDirection(msg);
     const metaMessageId = msg.id || msg.mid || null;
@@ -1873,151 +2042,8 @@ async function syncPageConversations() {
   };
 }
 
-function autoReplyRuleMatches(rule, commentText) {
-  const text = String(commentText || "").toLowerCase().trim();
-
-  if (!rule.is_enabled) return false;
-  if (rule.trigger_type === "any_comment") return true;
-
-  const keywords = Array.isArray(rule.keywords)
-    ? rule.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean)
-    : [];
-
-  if (keywords.length === 0) return false;
-
-  if (rule.trigger_type === "keyword") {
-    return keywords.some((keyword) => text.includes(keyword));
-  }
-
-  if (rule.trigger_type === "exact_match") {
-    return keywords.some((keyword) => text === keyword);
-  }
-
-  return false;
-}
-
-async function sendCommentPublicReply(igCommentId, message) {
-  const response = await graphPost(
-    `/${igCommentId}/replies`,
-    null,
-    {
-      message,
-      access_token: getInstagramToken() || getPageToken(),
-    },
-    { preferInstagram: true },
-  );
-
-  return response.data;
-}
-
-async function sendCommentPrivateReply(igCommentId, message) {
-  const response = await graphPost(
-    `/${igCommentId}/private_replies`,
-    null,
-    {
-      message,
-      access_token: getInstagramToken() || getPageToken(),
-    },
-    { preferInstagram: true },
-  );
-
-  return response.data;
-}
-
-async function applyAutoReplyRulesToComment(commentRow) {
-  if (!AUTO_REPLY_ENABLED || !commentRow?.ig_comment_id) return;
-
-  requireSupabaseConfig();
-
-  const { data: rules, error } = await supabase
-    .from("ig_auto_reply_rules")
-    .select("*")
-    .eq("is_enabled", true);
-
-  if (error) {
-    console.warn("Could not load auto reply rules:", error.message);
-    return;
-  }
-
-  for (const rule of rules || []) {
-    if (!autoReplyRuleMatches(rule, commentRow.text)) continue;
-
-    if (rule.only_once_per_user && commentRow.user_id) {
-      const { data: existingLog } = await supabase
-        .from("ig_auto_reply_logs")
-        .select("id")
-        .eq("rule_id", rule.id)
-        .eq("user_id", commentRow.user_id)
-        .eq("status", "sent")
-        .maybeSingle();
-
-      if (existingLog) {
-        await supabase.from("ig_auto_reply_logs").insert({
-          rule_id: rule.id,
-          ig_comment_id: commentRow.ig_comment_id,
-          ig_media_id: commentRow.ig_media_id,
-          username: commentRow.username,
-          user_id: commentRow.user_id,
-          reply_mode: rule.reply_mode,
-          status: "skipped",
-          message_text: "Skipped because only_once_per_user is enabled.",
-        });
-
-        continue;
-      }
-    }
-
-    try {
-      if (
-        (rule.reply_mode === "public_reply" || rule.reply_mode === "both") &&
-        rule.public_reply_text
-      ) {
-        await sendCommentPublicReply(commentRow.ig_comment_id, rule.public_reply_text);
-      }
-
-      if (
-        (rule.reply_mode === "private_reply" || rule.reply_mode === "both") &&
-        rule.private_reply_text
-      ) {
-        await sendCommentPrivateReply(commentRow.ig_comment_id, rule.private_reply_text);
-      }
-
-      await supabase.from("ig_auto_reply_logs").insert({
-        rule_id: rule.id,
-        ig_comment_id: commentRow.ig_comment_id,
-        ig_media_id: commentRow.ig_media_id,
-        username: commentRow.username,
-        user_id: commentRow.user_id,
-        reply_mode: rule.reply_mode,
-        message_text:
-          rule.reply_mode === "public_reply"
-            ? rule.public_reply_text
-            : rule.private_reply_text || rule.public_reply_text,
-        status: "sent",
-      });
-    } catch (replyError) {
-      await supabase.from("ig_auto_reply_logs").insert({
-        rule_id: rule.id,
-        ig_comment_id: commentRow.ig_comment_id,
-        ig_media_id: commentRow.ig_media_id,
-        username: commentRow.username,
-        user_id: commentRow.user_id,
-        reply_mode: rule.reply_mode,
-        message_text:
-          rule.reply_mode === "public_reply"
-            ? rule.public_reply_text
-            : rule.private_reply_text || rule.public_reply_text,
-        status: "failed",
-        error_message: replyError.response?.data
-          ? JSON.stringify(replyError.response.data)
-          : replyError.message,
-      });
-    }
-  }
-}
-
 /**
- * ROOT / HEALTH
+ * Health
  */
 app.get("/", (_req, res) => {
   res.json({
@@ -2071,7 +2097,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 /**
- * WEBHOOKS
+ * Webhooks
  */
 app.get("/api/webhooks/meta", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -2162,7 +2188,7 @@ app.post("/api/webhooks/meta", async (req, res) => {
 });
 
 /**
- * DEBUG
+ * Debug
  */
 app.get("/api/debug/token-status", (_req, res) => {
   const instagramToken = getInstagramToken();
@@ -2192,7 +2218,7 @@ app.get("/api/debug/webhook-events", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, events: data || [] });
+    res.json({ ok: true, events: data || [], data: data || [], items: data || [] });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -2216,7 +2242,13 @@ app.get("/api/debug/comments", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, count, comments: data || [] });
+    res.json({
+      ok: true,
+      count,
+      comments: data || [],
+      data: data || [],
+      items: data || [],
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -2246,11 +2278,15 @@ app.get("/api/debug/inbox", async (_req, res) => {
 
     if (error) throw error;
 
+    const rows = (data || []).map(withAliases);
+
     res.json({
       ok: true,
       conversationsCount,
       messagesCount,
-      conversations: data || [],
+      conversations: rows,
+      data: rows,
+      items: rows,
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
@@ -2258,7 +2294,7 @@ app.get("/api/debug/inbox", async (_req, res) => {
 });
 
 /**
- * META TEST
+ * Meta test
  */
 app.get("/api/meta/test-connection", async (_req, res) => {
   try {
@@ -2294,7 +2330,7 @@ app.post("/api/meta/test-connection", async (req, res) => {
 });
 
 /**
- * MEDIA
+ * Media upload / library
  */
 app.post("/api/upload", upload.any(), async (req, res) => {
   try {
@@ -2381,9 +2417,14 @@ app.get("/api/media", async (_req, res) => {
 
     if (error) throw error;
 
+    const rows = (data || []).map(withAliases);
+
     res.json({
       ok: true,
-      media: (data || []).map(withAliases),
+      media: rows,
+      data: rows,
+      items: rows,
+      count: rows.length,
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
@@ -2408,7 +2449,7 @@ app.delete("/api/media/:id", async (req, res) => {
 });
 
 /**
- * PUBLISH
+ * Publish
  */
 app.post("/api/meta/publish-now", async (req, res) => {
   try {
@@ -2439,7 +2480,7 @@ app.post("/api/meta/publish-now", async (req, res) => {
 });
 
 /**
- * CAPTION
+ * Captions
  */
 app.post("/api/gemini/generate-caption", async (req, res) => {
   try {
@@ -2502,7 +2543,7 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
 });
 
 /**
- * AI IMAGE EDIT
+ * AI image edit
  */
 app.post("/api/ai/edit-image", async (req, res) => {
   try {
@@ -2627,14 +2668,22 @@ app.get("/api/ai/results", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, results: (data || []).map(withAliases) });
+    const rows = (data || []).map(withAliases);
+
+    res.json({
+      ok: true,
+      results: rows,
+      data: rows,
+      items: rows,
+      count: rows.length,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
 /**
- * COMMENTS
+ * Comments
  */
 app.post("/api/comments/sync-media", async (_req, res) => {
   try {
@@ -2662,7 +2711,13 @@ app.post("/api/comments/sync-media", async (_req, res) => {
       }
     }
 
-    res.json({ ok: true, media: saved });
+    res.json({
+      ok: true,
+      media: saved,
+      data: saved,
+      items: saved,
+      count: saved.length,
+    });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -2730,6 +2785,32 @@ app.post("/api/comments/sync-all", async (_req, res) => {
   }
 });
 
+app.get("/api/comments/media", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("ig_media_cache")
+      .select("*")
+      .order("timestamp", { ascending: false, nullsFirst: false });
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      media: data || [],
+      data: data || [],
+      items: data || [],
+      count: data?.length || 0,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+
 app.post("/api/comments/sync", async (req, res) => {
   try {
     const igMediaId = req.body.igMediaId || req.body.ig_media_id;
@@ -2740,7 +2821,13 @@ app.post("/api/comments/sync", async (req, res) => {
 
     const saved = await syncCommentsForMedia(igMediaId);
 
-    res.json({ ok: true, comments: saved });
+    res.json({
+      ok: true,
+      comments: saved,
+      data: saved,
+      items: saved,
+      count: saved.length,
+    });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -2775,7 +2862,15 @@ app.get("/api/comments", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, comments: data || [] });
+    const rows = (data || []).map(withAliases);
+
+    res.json({
+      ok: true,
+      comments: rows,
+      data: rows,
+      items: rows,
+      count: rows.length,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -2839,8 +2934,81 @@ app.post("/api/comments/:commentId/private-reply", async (req, res) => {
   }
 });
 
+app.post("/api/comments/:commentId/like", async (req, res) => {
+  try {
+    const response = await graphPost(
+      `/${req.params.commentId}/likes`,
+      null,
+      {
+        access_token: getInstagramToken() || getPageToken(),
+      },
+      { preferInstagram: true },
+    );
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      unsupported: true,
+      error:
+        error.details ||
+        error.response?.data ||
+        "Instagram comment like is not supported by this API/token.",
+    });
+  }
+});
+
+app.post("/api/comments/:commentId/hide", async (req, res) => {
+  try {
+    const hide = req.body.hide !== false;
+
+    const response = await graphPost(
+      `/${req.params.commentId}`,
+      null,
+      {
+        hide,
+        access_token: getInstagramToken() || getPageToken(),
+      },
+      { preferInstagram: true },
+    );
+
+    await supabase
+      ?.from("ig_comments")
+      .update({ is_hidden: hide })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.delete("/api/comments/:commentId", async (req, res) => {
+  try {
+    const response = await axios.delete(metaGraphUrl(`/${req.params.commentId}`), {
+      params: { access_token: getPageToken() || getInstagramToken() },
+      timeout: 30000,
+    });
+
+    await supabase
+      ?.from("ig_comments")
+      .update({ is_deleted: true })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result: response.data });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.details || error.message,
+    });
+  }
+});
+
 /**
- * INBOX
+ * Inbox
  */
 app.get("/api/inbox/conversations", async (req, res) => {
   try {
@@ -2864,7 +3032,15 @@ app.get("/api/inbox/conversations", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, conversations: (data || []).map(withAliases) });
+    const rows = (data || []).map(withAliases);
+
+    res.json({
+      ok: true,
+      conversations: rows,
+      data: rows,
+      items: rows,
+      count: rows.length,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -2964,10 +3140,15 @@ app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
 
     if (error) throw error;
 
+    const rows = (data || []).map(withAliases);
+
     res.json({
       ok: true,
       conversation: withAliases(conversation),
-      messages: (data || []).map(withAliases),
+      messages: rows,
+      data: rows,
+      items: rows,
+      count: rows.length,
     });
   } catch (error) {
     res.status(500).json({
@@ -3062,8 +3243,102 @@ app.post("/api/inbox/send-text", async (req, res) => {
   }
 });
 
+app.post("/api/inbox/send-image", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { conversationId, recipientId, imageUrl } = req.body;
+
+    if (!recipientId || !imageUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "recipientId and imageUrl are required.",
+      });
+    }
+
+    let response = null;
+    let mode = null;
+
+    const messagePayload = {
+      recipient: { id: recipientId },
+      message: {
+        attachment: {
+          type: "image",
+          payload: {
+            url: imageUrl,
+            is_reusable: true,
+          },
+        },
+      },
+    };
+
+    if (hasPageTokenConfig()) {
+      response = await axios.post(
+        metaGraphUrl(`/${FACEBOOK_PAGE_ID}/messages`),
+        {
+          ...messagePayload,
+          messaging_type: "RESPONSE",
+        },
+        {
+          params: { access_token: getPageToken() },
+          timeout: 30000,
+        },
+      );
+
+      mode = "page";
+    } else if (hasInstagramTokenConfig()) {
+      response = await graphPost(
+        `/${IG_USER_ID}/messages`,
+        messagePayload,
+        {
+          access_token: getInstagramToken(),
+        },
+        { preferInstagram: true },
+      );
+
+      mode = "instagram";
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "No messaging token configured.",
+      });
+    }
+
+    if (conversationId && isValidUuid(conversationId)) {
+      await supabase.from("ig_messages").insert({
+        conversation_id: conversationId,
+        meta_message_id: response.data?.message_id || null,
+        ig_scoped_user_id: recipientId,
+        direction: "outbound",
+        message_type: "image",
+        media_url: imageUrl,
+        from_id: mode === "page" ? FACEBOOK_PAGE_ID : IG_USER_ID,
+        to_id: recipientId,
+        sent_at: new Date().toISOString(),
+        raw: response.data,
+      });
+
+      await supabase
+        .from("ig_conversations")
+        .update({
+          last_message_text: "[image]",
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", conversationId);
+    }
+
+    res.json({ ok: true, mode, result: response.data });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
 /**
- * POSTS
+ * Posts
  */
 app.post("/api/posts", async (req, res) => {
   try {
@@ -3098,6 +3373,8 @@ app.post("/api/posts", async (req, res) => {
       return res.json({
         ok: failed.length === 0,
         posts: created.map(withAliases),
+        data: created.map(withAliases),
+        items: created.map(withAliases),
         createdCount: created.length,
         failedCount: failed.length,
         failed,
@@ -3127,7 +3404,15 @@ app.get("/api/posts", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, posts: (data || []).map(withAliases) });
+    const rows = (data || []).map(withAliases);
+
+    res.json({
+      ok: true,
+      posts: rows,
+      data: rows,
+      items: rows,
+      count: rows.length,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -3209,7 +3494,7 @@ app.post("/api/posts/:id/retry", async (req, res) => {
 });
 
 /**
- * AUTO REPLY RULES
+ * Auto reply rules
  */
 app.get("/api/comments/auto-reply/rules", async (_req, res) => {
   try {
@@ -3222,7 +3507,13 @@ app.get("/api/comments/auto-reply/rules", async (_req, res) => {
 
     if (error) throw error;
 
-    res.json({ ok: true, rules: data || [] });
+    res.json({
+      ok: true,
+      rules: data || [],
+      data: data || [],
+      items: data || [],
+      count: data?.length || 0,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -3257,8 +3548,68 @@ app.post("/api/comments/auto-reply/rules", async (req, res) => {
   }
 });
 
+app.patch("/api/comments/auto-reply/rules/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const body = req.body;
+    const update = {};
+
+    if (body.name !== undefined) update.name = body.name;
+    if (body.isEnabled !== undefined || body.is_enabled !== undefined) {
+      update.is_enabled = body.isEnabled ?? body.is_enabled;
+    }
+    if (body.triggerType !== undefined || body.trigger_type !== undefined) {
+      update.trigger_type = body.triggerType || body.trigger_type;
+    }
+    if (body.keywords !== undefined) update.keywords = body.keywords;
+    if (body.replyMode !== undefined || body.reply_mode !== undefined) {
+      update.reply_mode = body.replyMode || body.reply_mode;
+    }
+    if (body.publicReplyText !== undefined || body.public_reply_text !== undefined) {
+      update.public_reply_text = body.publicReplyText ?? body.public_reply_text;
+    }
+    if (body.privateReplyText !== undefined || body.private_reply_text !== undefined) {
+      update.private_reply_text = body.privateReplyText ?? body.private_reply_text;
+    }
+    if (body.onlyOncePerUser !== undefined || body.only_once_per_user !== undefined) {
+      update.only_once_per_user = body.onlyOncePerUser ?? body.only_once_per_user;
+    }
+
+    const { data, error } = await supabase
+      .from("ig_auto_reply_rules")
+      .update(update)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ ok: true, rule: data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.delete("/api/comments/auto-reply/rules/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { error } = await supabase
+      .from("ig_auto_reply_rules")
+      .delete()
+      .eq("id", req.params.id);
+
+    if (error) throw error;
+
+    res.json({ ok: true, deleted: true });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 /**
- * CRON
+ * Cron
  */
 cron.schedule("*/5 * * * *", async () => {
   try {
