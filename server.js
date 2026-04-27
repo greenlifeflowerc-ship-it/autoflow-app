@@ -116,7 +116,7 @@ function cleanupFile(filePath) {
       fs.unlinkSync(filePath);
     }
   } catch {
-    // ignore cleanup errors
+    // Ignore cleanup errors.
   }
 }
 
@@ -129,12 +129,21 @@ function isPublicHttpsUrl(url) {
   }
 }
 
+function isValidUuid(value) {
+  if (!value) return false;
+
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value).trim()
+  );
+}
+
 function firstDefined(...values) {
   for (const value of values) {
     if (value !== undefined && value !== null && String(value).trim() !== "") {
       return value;
     }
   }
+
   return null;
 }
 
@@ -408,7 +417,10 @@ function normalizeInputHashtags(body) {
 }
 
 async function fetchMediaAssetById(mediaAssetId) {
-  if (!mediaAssetId) return null;
+  if (!isValidUuid(mediaAssetId)) {
+    console.warn("Skipping invalid mediaAssetId:", mediaAssetId);
+    return null;
+  }
 
   requireSupabaseConfig();
 
@@ -416,7 +428,7 @@ async function fetchMediaAssetById(mediaAssetId) {
     .from("media_assets")
     .select("*")
     .eq("id", mediaAssetId)
-    .single();
+    .maybeSingle();
 
   if (error) {
     console.warn("Could not fetch media asset:", error.message);
@@ -424,6 +436,42 @@ async function fetchMediaAssetById(mediaAssetId) {
   }
 
   return data;
+}
+
+async function resolveMediaAsset({ mediaAssetId, mediaUrl }) {
+  requireSupabaseConfig();
+
+  if (isValidUuid(mediaAssetId)) {
+    const { data, error } = await supabase
+      .from("media_assets")
+      .select("*")
+      .eq("id", mediaAssetId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("Could not fetch media asset by UUID:", error.message);
+    }
+
+    if (data) return data;
+  } else if (mediaAssetId) {
+    console.warn("Ignoring non-UUID mediaAssetId:", mediaAssetId);
+  }
+
+  if (mediaUrl) {
+    const { data, error } = await supabase
+      .from("media_assets")
+      .select("*")
+      .eq("media_url", mediaUrl)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("Could not fetch media asset by media_url:", error.message);
+    }
+
+    if (data) return data;
+  }
+
+  return null;
 }
 
 async function fetchImageAsInlineData(imageUrl) {
@@ -685,7 +733,11 @@ async function publishToInstagram({
   };
 }
 
-async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL, apiKey = GEMINI_API_KEY) {
+async function generateTextWithGemini(
+  prompt,
+  modelName = GEMINI_TEXT_MODEL,
+  apiKey = GEMINI_API_KEY
+) {
   requireGeminiConfig(apiKey);
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -983,7 +1035,7 @@ async function editImageWithGemini({
 }
 
 async function markMediaPublished(mediaAssetId, publishedAt) {
-  if (!mediaAssetId) return;
+  if (!mediaAssetId || !isValidUuid(mediaAssetId)) return;
 
   requireSupabaseConfig();
 
@@ -1063,18 +1115,23 @@ async function createScheduledPostFromInput(inputBody) {
   let { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
     normalizeMediaInput(inputBody);
 
-  const mediaAsset = mediaAssetId ? await fetchMediaAssetById(mediaAssetId) : null;
+  const mediaAsset = await resolveMediaAsset({
+    mediaAssetId,
+    mediaUrl
+  });
 
-  if (mediaAsset && !mediaUrl) {
-    mediaUrl = mediaAsset.media_url;
-    imageUrl = mediaAsset.image_url;
-    videoUrl = mediaAsset.video_url;
-    mediaType = mediaAsset.media_type;
+  if (mediaAsset) {
+    mediaAssetId = mediaAsset.id;
+    mediaUrl = mediaUrl || mediaAsset.media_url;
+    imageUrl = imageUrl || mediaAsset.image_url;
+    videoUrl = videoUrl || mediaAsset.video_url;
+    mediaType = mediaType || mediaAsset.media_type;
+  } else {
+    if (!isValidUuid(mediaAssetId)) {
+      console.warn("Ignoring non-UUID mediaAssetId:", mediaAssetId);
+      mediaAssetId = null;
+    }
   }
-
-  if (mediaAsset && !imageUrl) imageUrl = mediaAsset.image_url;
-  if (mediaAsset && !videoUrl) videoUrl = mediaAsset.video_url;
-  if (mediaAsset && !mediaType) mediaType = mediaAsset.media_type;
 
   const caption = normalizeCaption(inputBody);
   const hashtags = normalizeInputHashtags(inputBody);
@@ -1154,7 +1211,7 @@ async function createScheduledPostFromInput(inputBody) {
     throw error;
   }
 
-  if (mediaAssetId) {
+  if (mediaAssetId && isValidUuid(mediaAssetId)) {
     const { error: mediaUpdateError } = await supabase
       .from("media_assets")
       .update({
@@ -1444,7 +1501,7 @@ app.post("/api/meta/publish-now", async (req, res) => {
       caption
     });
 
-    if (mediaAssetId) {
+    if (mediaAssetId && isValidUuid(mediaAssetId)) {
       await markMediaPublished(mediaAssetId, new Date().toISOString());
     }
 
