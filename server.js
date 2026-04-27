@@ -88,8 +88,8 @@ function requireMetaConfig() {
   }
 }
 
-function requireGeminiConfig() {
-  if (!GEMINI_API_KEY) {
+function requireGeminiConfig(apiKey = GEMINI_API_KEY) {
+  if (!apiKey) {
     throw new Error("Missing GEMINI_API_KEY.");
   }
 }
@@ -116,7 +116,7 @@ function cleanupFile(filePath) {
       fs.unlinkSync(filePath);
     }
   } catch {
-    // ignore
+    // ignore cleanup errors
   }
 }
 
@@ -127,6 +127,15 @@ function isPublicHttpsUrl(url) {
   } catch {
     return false;
   }
+}
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return value;
+    }
+  }
+  return null;
 }
 
 function normalizeHashtags(hashtags) {
@@ -213,36 +222,6 @@ function detectMediaTypeFromFile(file) {
   return null;
 }
 
-function normalizeMediaInput(body) {
-  const rawMediaType = body.mediaType || body.media_type || null;
-
-  const mediaAssetId =
-    body.mediaAssetId || body.media_asset_id || body.mediaId || body.media_id || null;
-
-  const imageUrl = body.imageUrl || body.image_url || null;
-  const videoUrl = body.videoUrl || body.video_url || null;
-
-  const mediaUrl =
-    body.mediaUrl || body.media_url || imageUrl || videoUrl || null;
-
-  let mediaType = rawMediaType ? String(rawMediaType).toLowerCase() : null;
-
-  if (!mediaType && imageUrl) mediaType = "image";
-  if (!mediaType && videoUrl) mediaType = "video";
-  if (!mediaType && mediaUrl) mediaType = detectMediaTypeFromUrl(mediaUrl);
-
-  if (mediaType === "photo") mediaType = "image";
-  if (mediaType === "reel") mediaType = "video";
-
-  return {
-    mediaAssetId,
-    mediaUrl,
-    imageUrl,
-    videoUrl,
-    mediaType
-  };
-}
-
 function normalizeProvider(value) {
   const provider = String(value || AI_DEFAULT_PROVIDER || "gemini")
     .trim()
@@ -289,11 +268,10 @@ function classifyModel(provider, modelId, raw = {}) {
     lower.includes("gpt-4o") ||
     lower.includes("nano");
 
-  const supportsVideo =
-    lower.includes("video") ||
-    lower.includes("veo");
+  const supportsVideo = lower.includes("video") || lower.includes("veo");
 
   let type = "text";
+
   if (supportsVideo) type = "video";
   else if (supportsImage) type = "image";
 
@@ -325,6 +303,127 @@ function classifyModel(provider, modelId, raw = {}) {
     isFree,
     supportedGenerationMethods: methods
   };
+}
+
+function extractBodySource(body) {
+  return body.post || body.item || body.data || body.payload || body;
+}
+
+function normalizeMediaInput(body) {
+  const source = extractBodySource(body);
+  const media = source.media || source.mediaAsset || source.asset || {};
+
+  const mediaAssetId = firstDefined(
+    source.mediaAssetId,
+    source.media_asset_id,
+    source.mediaId,
+    source.media_id,
+    media.mediaAssetId,
+    media.media_asset_id,
+    media.id
+  );
+
+  const imageUrl = firstDefined(
+    source.imageUrl,
+    source.image_url,
+    media.imageUrl,
+    media.image_url
+  );
+
+  const videoUrl = firstDefined(
+    source.videoUrl,
+    source.video_url,
+    media.videoUrl,
+    media.video_url
+  );
+
+  const mediaUrl = firstDefined(
+    source.mediaUrl,
+    source.media_url,
+    source.url,
+    source.publicUrl,
+    source.public_url,
+    media.mediaUrl,
+    media.media_url,
+    media.url,
+    imageUrl,
+    videoUrl
+  );
+
+  let mediaType = firstDefined(
+    source.mediaType,
+    source.media_type,
+    media.mediaType,
+    media.media_type
+  );
+
+  mediaType = mediaType ? String(mediaType).toLowerCase() : null;
+
+  if (!mediaType && imageUrl) mediaType = "image";
+  if (!mediaType && videoUrl) mediaType = "video";
+  if (!mediaType && mediaUrl) mediaType = detectMediaTypeFromUrl(mediaUrl);
+
+  if (mediaType === "photo") mediaType = "image";
+  if (mediaType === "reel") mediaType = "video";
+
+  return {
+    mediaAssetId,
+    mediaUrl,
+    imageUrl,
+    videoUrl,
+    mediaType
+  };
+}
+
+function normalizeScheduledAt(body) {
+  const source = extractBodySource(body);
+
+  return firstDefined(
+    source.scheduledAt,
+    source.scheduled_at,
+    source.scheduleAt,
+    source.schedule_at,
+    source.scheduledFor,
+    source.scheduled_for,
+    source.publishAt,
+    source.publish_at,
+    source.dateTime,
+    source.datetime,
+    source.date_time,
+    source.time
+  );
+}
+
+function normalizeCaption(body) {
+  const source = extractBodySource(body);
+
+  return String(
+    firstDefined(source.caption, source.finalText, source.final_text, "") || ""
+  );
+}
+
+function normalizeInputHashtags(body) {
+  const source = extractBodySource(body);
+  return normalizeHashtags(source.hashtags || source.tags || []);
+}
+
+async function fetchMediaAssetById(mediaAssetId) {
+  if (!mediaAssetId) return null;
+
+  requireSupabaseConfig();
+
+  const { data, error } = await supabase
+    .from("media_assets")
+    .select("*")
+    .eq("id", mediaAssetId)
+    .single();
+
+  if (error) {
+    console.warn("Could not fetch media asset:", error.message);
+    return null;
+  }
+
+  return data;
 }
 
 async function fetchImageAsInlineData(imageUrl) {
@@ -586,10 +685,10 @@ async function publishToInstagram({
   };
 }
 
-async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL) {
-  requireGeminiConfig();
+async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL, apiKey = GEMINI_API_KEY) {
+  requireGeminiConfig(apiKey);
 
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({ model: modelName });
 
   const result = await model.generateContent(prompt);
@@ -599,11 +698,12 @@ async function generateTextWithGemini(prompt, modelName = GEMINI_TEXT_MODEL) {
 async function generateCaptionWithGeminiVision({
   imageUrl,
   prompt,
-  modelName = GEMINI_TEXT_MODEL
+  modelName = GEMINI_TEXT_MODEL,
+  apiKey = GEMINI_API_KEY
 }) {
-  requireGeminiConfig();
+  requireGeminiConfig(apiKey);
 
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({ model: modelName });
 
   try {
@@ -694,7 +794,7 @@ async function generateCaptionWithAI({
     apiKey
   });
 
-  if (!selectedApiKey && selectedProvider !== "gemini") {
+  if (!selectedApiKey) {
     throw new Error(`Missing API key for provider: ${selectedProvider}`);
   }
 
@@ -723,7 +823,8 @@ Return strict JSON only:
     text = await generateCaptionWithGeminiVision({
       imageUrl,
       prompt,
-      modelName: model || GEMINI_TEXT_MODEL
+      modelName: model || GEMINI_TEXT_MODEL,
+      apiKey: selectedApiKey
     });
   } else {
     text = await generateCaptionWithOpenAI({
@@ -757,7 +858,8 @@ async function generateEditPromptWithGemini({
   imageUrl,
   editStyle = "luxury interior background",
   language = "english",
-  model = GEMINI_TEXT_MODEL
+  model = GEMINI_TEXT_MODEL,
+  apiKey = GEMINI_API_KEY
 }) {
   const prompt = `
 Create a professional AI image editing prompt for this product image.
@@ -787,7 +889,8 @@ Return strict JSON only:
   const text = await generateCaptionWithGeminiVision({
     imageUrl,
     prompt,
-    modelName: model
+    modelName: model,
+    apiKey
   });
 
   const parsed = parseJsonLoose(text);
@@ -802,7 +905,7 @@ async function editImageWithGemini({
   prompt,
   model = GEMINI_IMAGE_MODEL
 }) {
-  requireGeminiConfig();
+  requireGeminiConfig(GEMINI_API_KEY);
 
   if (!originalImageUrl || !isPublicHttpsUrl(originalImageUrl)) {
     throw new Error("originalImageUrl must be a public HTTPS URL.");
@@ -818,10 +921,7 @@ async function editImageWithGemini({
     contents: [
       {
         role: "user",
-        parts: [
-          { text: prompt },
-          imagePart
-        ]
+        parts: [{ text: prompt }, imagePart]
       }
     ]
   };
@@ -955,6 +1055,123 @@ async function publishScheduledPost(post) {
 
     throw error;
   }
+}
+
+async function createScheduledPostFromInput(inputBody) {
+  requireSupabaseConfig();
+
+  let { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
+    normalizeMediaInput(inputBody);
+
+  const mediaAsset = mediaAssetId ? await fetchMediaAssetById(mediaAssetId) : null;
+
+  if (mediaAsset && !mediaUrl) {
+    mediaUrl = mediaAsset.media_url;
+    imageUrl = mediaAsset.image_url;
+    videoUrl = mediaAsset.video_url;
+    mediaType = mediaAsset.media_type;
+  }
+
+  if (mediaAsset && !imageUrl) imageUrl = mediaAsset.image_url;
+  if (mediaAsset && !videoUrl) videoUrl = mediaAsset.video_url;
+  if (mediaAsset && !mediaType) mediaType = mediaAsset.media_type;
+
+  const caption = normalizeCaption(inputBody);
+  const hashtags = normalizeInputHashtags(inputBody);
+  const scheduledAt = normalizeScheduledAt(inputBody);
+
+  if (!mediaUrl || !scheduledAt) {
+    const error = new Error("mediaUrl and scheduledAt are required.");
+    error.statusCode = 400;
+    error.details = {
+      received: inputBody,
+      parsed: {
+        mediaAssetId,
+        mediaUrl,
+        imageUrl,
+        videoUrl,
+        mediaType,
+        scheduledAt
+      }
+    };
+    throw error;
+  }
+
+  if (mediaType !== "image" && mediaType !== "video") {
+    const error = new Error("mediaType must be image or video.");
+    error.statusCode = 400;
+    error.details = {
+      received: inputBody,
+      parsed: {
+        mediaAssetId,
+        mediaUrl,
+        imageUrl,
+        videoUrl,
+        mediaType,
+        scheduledAt
+      }
+    };
+    throw error;
+  }
+
+  const parsedDate = new Date(scheduledAt);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    const error = new Error("scheduledAt is not a valid date.");
+    error.statusCode = 400;
+    error.details = {
+      received: inputBody,
+      scheduledAt
+    };
+    throw error;
+  }
+
+  const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
+
+  const insertPayload = {
+    media_asset_id: mediaAssetId,
+    media_url: mediaUrl,
+    image_url: imageUrl,
+    video_url: videoUrl,
+    media_type: mediaType,
+    caption,
+    hashtags,
+    final_text: finalText,
+    scheduled_at: parsedDate.toISOString(),
+    status: "approved"
+  };
+
+  console.log("Creating scheduled post payload:", insertPayload);
+
+  const { data: post, error } = await supabase
+    .from("scheduled_posts")
+    .insert(insertPayload)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("Supabase insert scheduled_posts failed:", error);
+    throw error;
+  }
+
+  if (mediaAssetId) {
+    const { error: mediaUpdateError } = await supabase
+      .from("media_assets")
+      .update({
+        is_scheduled: true,
+        scheduled_post_id: post.id,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", mediaAssetId);
+
+    if (mediaUpdateError) {
+      console.warn("Media asset schedule flag update failed:", mediaUpdateError);
+    }
+  }
+
+  console.log("Scheduled post created:", post.id);
+
+  return post;
 }
 
 /**
@@ -1254,9 +1471,9 @@ app.post("/api/meta/publish-now", async (req, res) => {
 /**
  * AI MODELS
  */
-app.post("/api/ai/list-models", async (req, res) => {
+async function listModelsHandler(req, res, forcedProvider = null) {
   try {
-    const provider = normalizeProvider(req.body.provider);
+    const provider = normalizeProvider(forcedProvider || req.body.provider);
     const apiKey = getProviderApiKey({
       provider,
       apiKey: req.body.apiKey
@@ -1333,12 +1550,12 @@ app.post("/api/ai/list-models", async (req, res) => {
       error: error.response?.data || error.message
     });
   }
-});
+}
 
-app.post("/api/gemini/list-models", async (req, res) => {
-  req.body.provider = "gemini";
-  return app._router.handle(req, res);
-});
+app.post("/api/ai/list-models", (req, res) => listModelsHandler(req, res));
+app.post("/api/gemini/list-models", (req, res) =>
+  listModelsHandler(req, res, "gemini")
+);
 
 app.post("/api/ai/test-model", async (req, res) => {
   try {
@@ -1487,6 +1704,8 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
       result
     });
   } catch (error) {
+    console.error("Generate caption failed:", error.response?.data || error.message);
+
     res.status(500).json({
       ok: false,
       error: error.response?.data || error.message
@@ -1507,12 +1726,19 @@ app.post("/api/gemini/generate-edit-prompt", async (req, res) => {
       });
     }
 
+    const provider = normalizeProvider(req.body.provider || "gemini");
+    const apiKey = getProviderApiKey({
+      provider,
+      apiKey: req.body.apiKey
+    });
+
     const result = await generateEditPromptWithGemini({
       imageUrl,
       editStyle:
         req.body.editStyle || req.body.edit_style || "luxury interior background",
       language: req.body.language || "english",
-      model: req.body.model || GEMINI_TEXT_MODEL
+      model: req.body.model || GEMINI_TEXT_MODEL,
+      apiKey
     });
 
     res.json({
@@ -1575,67 +1801,60 @@ app.post("/api/posts", async (req, res) => {
   try {
     requireSupabaseConfig();
 
-    const { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
-      normalizeMediaInput(req.body);
+    console.log("Create scheduled post body:", JSON.stringify(req.body));
 
-    const caption = req.body.caption || "";
-    const hashtags = normalizeHashtags(req.body.hashtags);
-    const scheduledAt = getBodyValue(req.body, "scheduledAt", "scheduled_at");
+    const isBulk =
+      Array.isArray(req.body) ||
+      Array.isArray(req.body.posts) ||
+      Array.isArray(req.body.items);
 
-    if (!mediaUrl || !scheduledAt) {
-      return res.status(400).json({
-        ok: false,
-        error: "mediaUrl and scheduledAt are required."
+    if (isBulk) {
+      const items = Array.isArray(req.body)
+        ? req.body
+        : req.body.posts || req.body.items;
+
+      const created = [];
+      const failed = [];
+
+      for (const item of items) {
+        try {
+          const post = await createScheduledPostFromInput(item);
+          created.push(post);
+        } catch (error) {
+          failed.push({
+            item,
+            error: error.message,
+            details: error.details || null
+          });
+        }
+      }
+
+      return res.json({
+        ok: failed.length === 0,
+        posts: created,
+        createdCount: created.length,
+        failedCount: failed.length,
+        failed
       });
     }
 
-    if (mediaType !== "image" && mediaType !== "video") {
-      return res.status(400).json({
-        ok: false,
-        error: "mediaType must be image or video."
-      });
-    }
-
-    const finalText = `${caption}\n${hashtags.join(" ")}`.trim();
-
-    const { data: post, error } = await supabase
-      .from("scheduled_posts")
-      .insert({
-        media_asset_id: mediaAssetId,
-        media_url: mediaUrl,
-        image_url: imageUrl,
-        video_url: videoUrl,
-        media_type: mediaType,
-        caption,
-        hashtags,
-        final_text: finalText,
-        scheduled_at: scheduledAt,
-        status: "approved"
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    if (mediaAssetId) {
-      await supabase
-        .from("media_assets")
-        .update({
-          is_scheduled: true,
-          scheduled_post_id: post.id,
-          updated_at: new Date().toISOString()
-        })
-        .eq("id", mediaAssetId);
-    }
+    const post = await createScheduledPostFromInput(req.body);
 
     res.json({
       ok: true,
       post
     });
   } catch (error) {
-    res.status(500).json({
+    console.error("Create scheduled post failed:", {
+      body: req.body,
+      error: error.response?.data || error.message || error,
+      details: error.details || null
+    });
+
+    res.status(error.statusCode || 500).json({
       ok: false,
-      error: error.message
+      error: error.response?.data || error.message || String(error),
+      details: error.details || null
     });
   }
 });
@@ -1670,15 +1889,19 @@ app.patch("/api/posts/:id", async (req, res) => {
     const update = {};
 
     if (req.body.caption !== undefined) update.caption = req.body.caption;
+
     if (req.body.hashtags !== undefined) {
       update.hashtags = normalizeHashtags(req.body.hashtags);
     }
+
     if (req.body.finalText !== undefined || req.body.final_text !== undefined) {
       update.final_text = req.body.finalText || req.body.final_text;
     }
+
     if (req.body.scheduledAt !== undefined || req.body.scheduled_at !== undefined) {
       update.scheduled_at = req.body.scheduledAt || req.body.scheduled_at;
     }
+
     if (req.body.status !== undefined) update.status = req.body.status;
 
     update.updated_at = new Date().toISOString();
@@ -1781,7 +2004,13 @@ cron.schedule("*/5 * * * *", async () => {
 
     if (error) throw error;
 
-    for (const post of duePosts || []) {
+    if (!duePosts || duePosts.length === 0) {
+      return;
+    }
+
+    console.log(`Cron found ${duePosts.length} due posts.`);
+
+    for (const post of duePosts) {
       try {
         console.log(`Cron publishing post ${post.id}`);
         await publishScheduledPost(post);
@@ -1793,7 +2022,7 @@ cron.schedule("*/5 * * * *", async () => {
       }
     }
   } catch (error) {
-    console.error("Cron scheduler failed:", error.message);
+    console.error("Cron scheduler failed:", error.response?.data || error.message);
   }
 });
 
