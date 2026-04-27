@@ -2525,4 +2525,786 @@ app.post("/api/ai/edit-image", async (req, res) => {
     const editMode = req.body.editMode || req.body.edit_mode || "background_only";
     const aspectRatio = req.body.aspectRatio || req.body.aspect_ratio || "4:5";
     const outputSize = req.body.outputSize || req.body.output_size || "1080x1350";
-    const resolution = Number(req.body.resol
+    const resolution = Number(req.body.resolution || 1080);
+    const quality = req.body.quality || "high";
+    const userPrompt = req.body.prompt || req.body.ai_edit_prompt || "";
+
+    if (!userPrompt) {
+      return res.status(400).json({ ok: false, error: "prompt is required." });
+    }
+
+    const finalPrompt = buildAiEditPrompt({
+      preset: req.body.preset || "Custom",
+      customPrompt: req.body.customPrompt || "",
+      editMode,
+      preserveProduct: req.body.preserveProduct !== false,
+      keepPot: req.body.keepPot !== false,
+      aspectRatio,
+      outputSize,
+      resolution,
+      quality,
+      backgroundIntensity:
+        req.body.backgroundIntensity || req.body.background_intensity || "medium",
+      userPrompt,
+    });
+
+    const { data: job, error: jobError } = await supabase
+      .from("ai_jobs")
+      .insert({
+        job_type: "single_edit",
+        status: "processing",
+        total_items: 1,
+        completed_items: 0,
+        failed_items: 0,
+        provider: "gemini",
+        model,
+        edit_mode: editMode,
+        aspect_ratio: aspectRatio,
+        output_size: outputSize,
+        resolution,
+        quality,
+      })
+      .select()
+      .single();
+
+    if (jobError) throw jobError;
+
+    const result = await editImageWithGemini({
+      originalImageUrl,
+      prompt: finalPrompt,
+      model,
+    });
+
+    const savedMedia = await insertAiGeneratedMedia({
+      editedImageUrl: result.editedImageUrl,
+      sourceMediaAssetId: mediaAssetId,
+      aiJobId: job.id,
+      prompt: finalPrompt,
+      editMode,
+      provider: "gemini",
+      model,
+      aspectRatio,
+      outputSize,
+      resolution,
+      quality,
+    });
+
+    await supabase
+      .from("ai_jobs")
+      .update({
+        status: "completed",
+        completed_items: 1,
+        failed_items: 0,
+      })
+      .eq("id", job.id);
+
+    res.json({
+      ok: true,
+      result: {
+        jobId: job.id,
+        editedImageUrl: result.editedImageUrl,
+        savedMediaAssetId: savedMedia?.id || null,
+        media: withAliases(savedMedia),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.response?.data || error.details || error.message,
+    });
+  }
+});
+
+app.get("/api/ai/results", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("media_assets")
+      .select("*")
+      .eq("is_ai_generated", true)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ ok: true, results: (data || []).map(withAliases) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/**
+ * COMMENTS
+ */
+app.post("/api/comments/sync-media", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+    requireInstagramConfig();
+
+    const mediaResponse = await graphGet(
+      `/${IG_USER_ID}/media`,
+      {
+        fields:
+          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
+        access_token: getInstagramToken(),
+      },
+      { preferInstagram: true },
+    );
+
+    const saved = [];
+
+    for (const media of mediaResponse.data?.data || []) {
+      try {
+        const row = await saveMediaCache(media);
+        saved.push(row);
+      } catch (error) {
+        console.warn("Media cache save failed:", error.message);
+      }
+    }
+
+    res.json({ ok: true, media: saved });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.post("/api/comments/sync-all", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+    requireInstagramConfig();
+
+    const errors = [];
+    let mediaCount = 0;
+    let commentsCount = 0;
+
+    const mediaResponse = await graphGet(
+      `/${IG_USER_ID}/media`,
+      {
+        fields:
+          "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp,comments_count",
+        access_token: getInstagramToken(),
+      },
+      { preferInstagram: true },
+    );
+
+    const mediaItems = mediaResponse.data?.data || [];
+
+    for (const media of mediaItems) {
+      try {
+        await saveMediaCache(media);
+        mediaCount += 1;
+      } catch (error) {
+        errors.push({
+          stage: "media_cache",
+          mediaId: media.id,
+          error: error.response?.data || error.message,
+        });
+      }
+
+      try {
+        const savedComments = await syncCommentsForMedia(media.id);
+        commentsCount += savedComments.length;
+      } catch (error) {
+        errors.push({
+          stage: "comments",
+          mediaId: media.id,
+          error: error.details || error.response?.data || error.message,
+        });
+      }
+    }
+
+    res.json({
+      ok: true,
+      mediaCount,
+      commentsCount,
+      errors,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.post("/api/comments/sync", async (req, res) => {
+  try {
+    const igMediaId = req.body.igMediaId || req.body.ig_media_id;
+
+    if (!igMediaId) {
+      return res.status(400).json({ ok: false, error: "igMediaId is required." });
+    }
+
+    const saved = await syncCommentsForMedia(igMediaId);
+
+    res.json({ ok: true, comments: saved });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.get("/api/comments", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    let query = supabase
+      .from("ig_comments")
+      .select("*")
+      .order("timestamp", { ascending: false });
+
+    if (req.query.igMediaId) {
+      query = query.eq("ig_media_id", req.query.igMediaId);
+    }
+
+    if (req.query.unreplied === "true") {
+      query = query.eq("replied_by_app", false).eq("private_replied_by_app", false);
+    }
+
+    if (req.query.search) {
+      const search = `%${req.query.search}%`;
+      query = query.or(`username.ilike.${search},text.ilike.${search}`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    res.json({ ok: true, comments: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/comments/:commentId/reply", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const message = req.body.message;
+
+    if (!message) {
+      return res.status(400).json({ ok: false, error: "message is required." });
+    }
+
+    const result = await sendCommentPublicReply(req.params.commentId, message);
+
+    await supabase
+      .from("ig_comments")
+      .update({
+        replied_by_app: true,
+        replied_at: new Date().toISOString(),
+      })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.post("/api/comments/:commentId/private-reply", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const message = req.body.message;
+
+    if (!message) {
+      return res.status(400).json({ ok: false, error: "message is required." });
+    }
+
+    const result = await sendCommentPrivateReply(req.params.commentId, message);
+
+    await supabase
+      .from("ig_comments")
+      .update({
+        private_replied_by_app: true,
+        private_replied_at: new Date().toISOString(),
+      })
+      .eq("ig_comment_id", req.params.commentId);
+
+    res.json({ ok: true, result });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+/**
+ * INBOX
+ */
+app.get("/api/inbox/conversations", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    let query = supabase
+      .from("ig_conversations")
+      .select("*")
+      .order("last_message_at", { ascending: false, nullsFirst: false });
+
+    if (req.query.status) {
+      query = query.eq("status", req.query.status);
+    }
+
+    if (req.query.search) {
+      const search = `%${req.query.search}%`;
+      query = query.or(`username.ilike.${search},last_message_text.ilike.${search}`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    res.json({ ok: true, conversations: (data || []).map(withAliases) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/inbox/sync-instagram", async (_req, res) => {
+  try {
+    const result = await syncInstagramConversations();
+
+    res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      requiresPageToken: true,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.post("/api/inbox/sync-conversations", async (_req, res) => {
+  const errors = [];
+
+  try {
+    const instagramResult = await syncInstagramConversations();
+
+    return res.json({
+      ok: true,
+      mode: "instagram",
+      ...instagramResult,
+    });
+  } catch (instagramError) {
+    errors.push({
+      mode: "instagram",
+      error:
+        instagramError.details ||
+        instagramError.response?.data ||
+        instagramError.message,
+    });
+  }
+
+  if (hasPageTokenConfig()) {
+    try {
+      const pageResult = await syncPageConversations();
+
+      return res.json({
+        ok: true,
+        mode: "page",
+        ...pageResult,
+        previousErrors: errors,
+      });
+    } catch (pageError) {
+      errors.push({
+        mode: "page",
+        error: pageError.response?.data || pageError.message,
+      });
+    }
+  }
+
+  return res.status(500).json({
+    ok: false,
+    errors,
+  });
+});
+
+app.get("/api/inbox/conversations/:id/messages", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data: conversation, error: convError } = await supabase
+      .from("ig_conversations")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (convError) throw convError;
+
+    if (req.query.sync === "true" && conversation.meta_conversation_id) {
+      try {
+        const messages = await fetchMessagesForConversation(conversation.meta_conversation_id);
+        await saveConversationMessages(conversation, messages);
+      } catch (syncError) {
+        console.warn(
+          "Message sync on open failed:",
+          syncError.details || syncError.response?.data || syncError.message,
+        );
+      }
+    }
+
+    const { data, error } = await supabase
+      .from("ig_messages")
+      .select("*")
+      .eq("conversation_id", req.params.id)
+      .order("sent_at", { ascending: true });
+
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      conversation: withAliases(conversation),
+      messages: (data || []).map(withAliases),
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+app.post("/api/inbox/send-text", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { conversationId, recipientId, text } = req.body;
+
+    if (!recipientId || !text) {
+      return res.status(400).json({
+        ok: false,
+        error: "recipientId and text are required.",
+      });
+    }
+
+    let response = null;
+    let mode = null;
+
+    if (hasPageTokenConfig()) {
+      response = await axios.post(
+        metaGraphUrl(`/${FACEBOOK_PAGE_ID}/messages`),
+        {
+          recipient: { id: recipientId },
+          messaging_type: "RESPONSE",
+          message: { text },
+        },
+        {
+          params: { access_token: getPageToken() },
+          timeout: 30000,
+        },
+      );
+
+      mode = "page";
+    } else if (hasInstagramTokenConfig()) {
+      response = await graphPost(
+        `/${IG_USER_ID}/messages`,
+        {
+          recipient: { id: recipientId },
+          message: { text },
+        },
+        {
+          access_token: getInstagramToken(),
+        },
+        { preferInstagram: true },
+      );
+
+      mode = "instagram";
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "No messaging token configured.",
+      });
+    }
+
+    if (conversationId && isValidUuid(conversationId)) {
+      await supabase.from("ig_messages").insert({
+        conversation_id: conversationId,
+        meta_message_id: response.data?.message_id || null,
+        ig_scoped_user_id: recipientId,
+        direction: "outbound",
+        message_type: "text",
+        text,
+        from_id: mode === "page" ? FACEBOOK_PAGE_ID : IG_USER_ID,
+        to_id: recipientId,
+        sent_at: new Date().toISOString(),
+        raw: response.data,
+      });
+
+      await supabase
+        .from("ig_conversations")
+        .update({
+          last_message_text: text,
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", conversationId);
+    }
+
+    res.json({ ok: true, mode, result: response.data });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.details || error.response?.data || error.message,
+    });
+  }
+});
+
+/**
+ * POSTS
+ */
+app.post("/api/posts", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const isBulk =
+      Array.isArray(req.body) ||
+      Array.isArray(req.body.posts) ||
+      Array.isArray(req.body.items);
+
+    if (isBulk) {
+      const items = Array.isArray(req.body)
+        ? req.body
+        : req.body.posts || req.body.items;
+
+      const created = [];
+      const failed = [];
+
+      for (const item of items) {
+        try {
+          const post = await createScheduledPostFromInput(item);
+          created.push(post);
+        } catch (error) {
+          failed.push({
+            item,
+            error: error.message,
+            details: error.details || null,
+          });
+        }
+      }
+
+      return res.json({
+        ok: failed.length === 0,
+        posts: created.map(withAliases),
+        createdCount: created.length,
+        failedCount: failed.length,
+        failed,
+      });
+    }
+
+    const post = await createScheduledPostFromInput(req.body);
+
+    res.json({ ok: true, post: withAliases(post) });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      ok: false,
+      error: error.response?.data || error.message || String(error),
+      details: error.details || null,
+    });
+  }
+});
+
+app.get("/api/posts", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("scheduled_posts")
+      .select("*")
+      .order("scheduled_at", { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ ok: true, posts: (data || []).map(withAliases) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.patch("/api/posts/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const update = {};
+
+    if (req.body.caption !== undefined) update.caption = req.body.caption;
+    if (req.body.hashtags !== undefined) update.hashtags = normalizeHashtags(req.body.hashtags);
+    if (req.body.finalText !== undefined || req.body.final_text !== undefined) {
+      update.final_text = req.body.finalText || req.body.final_text;
+    }
+    if (req.body.scheduledAt !== undefined || req.body.scheduled_at !== undefined) {
+      update.scheduled_at = req.body.scheduledAt || req.body.scheduled_at;
+    }
+    if (req.body.status !== undefined) update.status = req.body.status;
+
+    update.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("scheduled_posts")
+      .update(update)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ ok: true, post: withAliases(data) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.delete("/api/posts/:id", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("scheduled_posts")
+      .update({
+        status: "cancelled",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ ok: true, post: withAliases(data) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/posts/:id/retry", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error) throw error;
+
+    const updatedPost = await publishScheduledPost(post);
+
+    res.json({ ok: true, post: withAliases(updatedPost) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.response?.data || error.message });
+  }
+});
+
+/**
+ * AUTO REPLY RULES
+ */
+app.get("/api/comments/auto-reply/rules", async (_req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const { data, error } = await supabase
+      .from("ig_auto_reply_rules")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ ok: true, rules: data || [] });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/comments/auto-reply/rules", async (req, res) => {
+  try {
+    requireSupabaseConfig();
+
+    const body = req.body;
+
+    const { data, error } = await supabase
+      .from("ig_auto_reply_rules")
+      .insert({
+        name: body.name,
+        is_enabled: body.isEnabled ?? body.is_enabled ?? false,
+        trigger_type: body.triggerType || body.trigger_type || "any_comment",
+        keywords: Array.isArray(body.keywords) ? body.keywords : [],
+        reply_mode: body.replyMode || body.reply_mode || "private_reply",
+        public_reply_text: body.publicReplyText || body.public_reply_text || null,
+        private_reply_text: body.privateReplyText || body.private_reply_text || null,
+        only_once_per_user: body.onlyOncePerUser ?? body.only_once_per_user ?? true,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ ok: true, rule: data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/**
+ * CRON
+ */
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    if (!supabase) {
+      console.warn("Supabase not configured. Cron skipped.");
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const { data: duePosts, error } = await supabase
+      .from("scheduled_posts")
+      .select("*")
+      .in("status", ["approved", "scheduled"])
+      .lte("scheduled_at", nowIso)
+      .lt("publish_attempts", 3)
+      .order("scheduled_at", { ascending: true })
+      .limit(10);
+
+    if (error) throw error;
+
+    for (const post of duePosts || []) {
+      try {
+        await publishScheduledPost(post);
+      } catch (error) {
+        console.error(
+          `Failed scheduled post ${post.id}:`,
+          error.response?.data || error.details || error.message,
+        );
+      }
+    }
+  } catch (error) {
+    console.error("Cron scheduler failed:", error.response?.data || error.message);
+  }
+});
+
+/**
+ * 404
+ */
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: `Endpoint not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`AutoFlow Backend running on port ${PORT}`);
+});
