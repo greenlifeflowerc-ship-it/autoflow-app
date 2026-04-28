@@ -583,10 +583,6 @@ function normalizeMessageType(rawType, hasText) {
   return "unknown";
 }
 
-/**
- * Safe media insert.
- * مهم: هذا يحاول يدخل أعمدة إضافية، وإذا قاعدة البيانات قديمة وما فيها الأعمدة، يرجع للإدخال الأساسي.
- */
 async function insertMediaAssetSafe(payload) {
   requireSupabaseConfig();
 
@@ -806,10 +802,6 @@ async function uploadVideo(file) {
   };
 }
 
-/**
- * Cloudinary sync.
- * يسحب الصور والفيديوهات الموجودة في Cloudinary حتى لو مرفوعة من خارج البرنامج.
- */
 async function upsertCloudinaryResource(resource) {
   requireSupabaseConfig();
 
@@ -849,8 +841,6 @@ async function upsertCloudinaryResource(resource) {
     is_uploaded: true,
     is_scheduled: false,
     is_published: false,
-
-    // Optional columns. إذا مش موجودة، insertMediaAssetSafe بيرجع للإدخال الأساسي.
     cloudinary_public_id: resource.public_id || null,
     cloudinary_asset_id: resource.asset_id || null,
     cloudinary_resource_type: resource.resource_type || null,
@@ -934,9 +924,6 @@ async function syncCloudinaryResources() {
   };
 }
 
-/**
- * Instagram publish.
- */
 async function pollMediaContainerStatus(containerId) {
   await sleep(3000);
 
@@ -1053,9 +1040,6 @@ async function publishToInstagram({ mediaUrl, imageUrl, videoUrl, mediaType, cap
   };
 }
 
-/**
- * Gemini / AI.
- */
 function buildCaptionPrompt({
   language,
   tone,
@@ -1365,9 +1349,6 @@ async function insertAiGeneratedMedia({
   return media;
 }
 
-/**
- * Scheduled posts helpers.
- */
 async function markMediaPublished(mediaAssetId, publishedAt) {
   if (!mediaAssetId || !isValidUuid(mediaAssetId)) return;
 
@@ -1512,9 +1493,6 @@ async function createScheduledPostFromInput(inputBody) {
   return post;
 }
 
-/**
- * Webhook helpers.
- */
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
 
@@ -1565,9 +1543,6 @@ async function storeWebhookEvent({
   return data;
 }
 
-/**
- * Comments helpers.
- */
 async function fetchCommentDetails(commentId) {
   const response = await graphGet(
     `/${commentId}`,
@@ -1877,9 +1852,6 @@ async function applyAutoReplyRulesToComment(commentRow) {
   }
 }
 
-/**
- * Inbox helpers.
- */
 async function upsertConversationFromMessage({ senderId, text, sentAt }) {
   requireSupabaseConfig();
 
@@ -2267,9 +2239,6 @@ async function syncPageConversations() {
   };
 }
 
-/**
- * Health.
- */
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -2325,9 +2294,6 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-/**
- * Webhooks.
- */
 app.get("/api/webhooks/meta", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -2445,9 +2411,6 @@ app.post("/api/cloudinary/webhook", async (req, res) => {
   }
 });
 
-/**
- * Debug.
- */
 app.get("/api/debug/token-status", (_req, res) => {
   const instagramToken = getInstagramToken();
   const pageToken = getPageToken();
@@ -2551,9 +2514,6 @@ app.get("/api/debug/inbox", async (_req, res) => {
   }
 });
 
-/**
- * Meta test.
- */
 app.get("/api/meta/test-connection", async (_req, res) => {
   try {
     requireInstagramConfig();
@@ -2587,9 +2547,6 @@ app.post("/api/meta/test-connection", async (req, res) => {
   app.handle(req, res);
 });
 
-/**
- * Cloudinary sync endpoints.
- */
 app.get("/api/cloudinary/sync", async (_req, res) => {
   try {
     const result = await syncCloudinaryResources();
@@ -2620,9 +2577,6 @@ app.post("/api/cloudinary/sync", async (_req, res) => {
   }
 });
 
-/**
- * Media upload / library.
- */
 app.post("/api/upload", upload.any(), async (req, res) => {
   const uploadedFiles = [];
 
@@ -2787,9 +2741,6 @@ app.delete("/api/media/:id", async (req, res) => {
   }
 });
 
-/**
- * Publish now.
- */
 app.post("/api/meta/publish-now", async (req, res) => {
   try {
     const { mediaAssetId, mediaUrl, imageUrl, videoUrl, mediaType } =
@@ -2818,9 +2769,6 @@ app.post("/api/meta/publish-now", async (req, res) => {
   }
 });
 
-/**
- * Captions.
- */
 app.post("/api/gemini/generate-caption", async (req, res) => {
   try {
     const imageUrl =
@@ -2878,9 +2826,6 @@ app.post("/api/gemini/generate-caption", async (req, res) => {
   }
 });
 
-/**
- * AI image edit.
- */
 app.post("/api/ai/edit-image", async (req, res) => {
   try {
     requireSupabaseConfig();
@@ -3029,9 +2974,6 @@ app.get("/api/ai/results", async (_req, res) => {
   }
 });
 
-/**
- * Comments.
- */
 app.post("/api/comments/sync-media", async (_req, res) => {
   try {
     requireSupabaseConfig();
@@ -3316,9 +3258,6 @@ app.post("/api/comments/:commentId/hide", async (req, res) => {
   }
 });
 
-/**
- * Inbox.
- */
 app.get("/api/inbox/conversations", async (req, res) => {
   try {
     requireSupabaseConfig();
@@ -3393,18 +3332,131 @@ app.get("/api/inbox/sync-instagram", async (_req, res) => {
 
 app.post("/api/inbox/sync-conversations", async (_req, res) => {
   const errors = [];
+  let instagramResult = null;
 
   try {
-    const instagramResult = await syncInstagramConversations();
+    instagramResult = await syncInstagramConversations();
+
+    const instagramConversationsCount = Number(
+      instagramResult?.conversationsCount || 0,
+    );
+    const instagramMessagesCount = Number(instagramResult?.messagesCount || 0);
+
+    if (instagramConversationsCount > 0) {
+      console.log("Inbox sync final result:", {
+        mode: "instagram",
+        conversationsCount: instagramConversationsCount,
+        messagesCount: instagramMessagesCount,
+        errorsCount: instagramResult?.errors?.length || 0,
+      });
+
+      return res.json({
+        ok: true,
+        mode: "instagram",
+        ...instagramResult,
+      });
+    }
+
+    console.log(
+      "Instagram inbox sync returned 0 conversations. Checking Page fallback...",
+      {
+        instagramConversationsCount,
+        instagramMessagesCount,
+        hasPageToken: hasPageTokenConfig(),
+      },
+    );
+
+    if (hasPageTokenConfig()) {
+      try {
+        const pageResult = await syncPageConversations();
+
+        const pageConversationsCount = Number(
+          pageResult?.conversationsCount || 0,
+        );
+        const pageMessagesCount = Number(pageResult?.messagesCount || 0);
+
+        const finalMode =
+          pageConversationsCount > 0 ? "page" : "instagram+page";
+
+        console.log("Inbox sync final result:", {
+          mode: finalMode,
+          instagramConversationsCount,
+          instagramMessagesCount,
+          pageConversationsCount,
+          pageMessagesCount,
+          instagramErrorsCount: instagramResult?.errors?.length || 0,
+          pageErrorsCount: pageResult?.errors?.length || 0,
+        });
+
+        return res.json({
+          ok: true,
+          mode: finalMode,
+          conversationsCount: pageConversationsCount,
+          messagesCount: pageMessagesCount,
+          errors: pageResult?.errors || [],
+          previousInstagramResult: instagramResult,
+          instagramResult,
+          pageResult,
+        });
+      } catch (pageError) {
+        const normalizedPageError =
+          pageError.response?.data || pageError.details || pageError.message;
+
+        errors.push({
+          mode: "page",
+          error: normalizedPageError,
+        });
+
+        console.log("Page inbox fallback failed after Instagram returned 0:", {
+          instagramConversationsCount,
+          instagramMessagesCount,
+          pageError: normalizedPageError,
+        });
+
+        return res.json({
+          ok: true,
+          mode: "instagram",
+          conversationsCount: instagramConversationsCount,
+          messagesCount: instagramMessagesCount,
+          errors: [...(instagramResult?.errors || []), ...errors],
+          pageFallbackAttempted: true,
+          pageFallbackFailed: true,
+          previousInstagramResult: instagramResult,
+          instagramResult,
+        });
+      }
+    }
+
+    console.log("Inbox sync final result:", {
+      mode: "instagram",
+      conversationsCount: instagramConversationsCount,
+      messagesCount: instagramMessagesCount,
+      pageFallbackAttempted: false,
+      reason: "FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN not configured.",
+    });
 
     return res.json({
       ok: true,
       mode: "instagram",
-      ...instagramResult,
+      conversationsCount: instagramConversationsCount,
+      messagesCount: instagramMessagesCount,
+      errors: instagramResult?.errors || [],
+      pageFallbackAttempted: false,
+      pageFallbackReason:
+        "FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN not configured.",
+      instagramResult,
     });
   } catch (instagramError) {
     errors.push({
       mode: "instagram",
+      error:
+        instagramError.details ||
+        instagramError.response?.data ||
+        instagramError.message,
+    });
+
+    console.log("Instagram inbox sync failed. Checking Page fallback...", {
+      hasPageToken: hasPageTokenConfig(),
       error:
         instagramError.details ||
         instagramError.response?.data ||
@@ -3416,6 +3468,14 @@ app.post("/api/inbox/sync-conversations", async (_req, res) => {
     try {
       const pageResult = await syncPageConversations();
 
+      console.log("Inbox sync final result:", {
+        mode: "page",
+        conversationsCount: pageResult?.conversationsCount || 0,
+        messagesCount: pageResult?.messagesCount || 0,
+        previousErrorsCount: errors.length,
+        pageErrorsCount: pageResult?.errors?.length || 0,
+      });
+
       return res.json({
         ok: true,
         mode: "page",
@@ -3425,10 +3485,16 @@ app.post("/api/inbox/sync-conversations", async (_req, res) => {
     } catch (pageError) {
       errors.push({
         mode: "page",
-        error: pageError.response?.data || pageError.message,
+        error: pageError.response?.data || pageError.details || pageError.message,
       });
     }
   }
+
+  console.log("Inbox sync final result:", {
+    ok: false,
+    mode: "failed",
+    errorsCount: errors.length,
+  });
 
   return res.status(500).json({
     ok: false,
@@ -3665,9 +3731,6 @@ app.post("/api/inbox/send-image", async (req, res) => {
   }
 });
 
-/**
- * Posts.
- */
 app.post("/api/posts", async (req, res) => {
   try {
     requireSupabaseConfig();
@@ -3823,9 +3886,6 @@ app.post("/api/posts/:id/retry", async (req, res) => {
   }
 });
 
-/**
- * Auto reply rules.
- */
 app.get("/api/comments/auto-reply/rules", async (_req, res) => {
   try {
     requireSupabaseConfig();
@@ -3938,9 +3998,6 @@ app.delete("/api/comments/auto-reply/rules/:id", async (req, res) => {
   }
 });
 
-/**
- * Cron scheduler.
- */
 cron.schedule("*/5 * * * *", async () => {
   try {
     if (!supabase) {
@@ -3976,9 +4033,6 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
-/**
- * 404.
- */
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
